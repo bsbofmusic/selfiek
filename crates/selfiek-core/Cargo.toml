@@ -1,0 +1,25 @@
+[package]
+name = "selfiek-core"
+version = "3.5.0"
+edition = "2021"
+license = "MIT"
+authors = ["bsbofmusic"]
+repository = "https://github.com/bsbofmusic/selfiek"
+description = "Rust core for the SelfieK K/Kate selfie pipeline"
+
+[[bin]]
+name = "selfiek-core"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+fs2 = "0.4"
+image = { version = "0.24", default-features = false, features = ["jpeg", "png"] }
+md5 = "0.7"
+rand = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+walkdir = "2"

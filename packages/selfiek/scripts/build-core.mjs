@@ -1,0 +1,20 @@
+import { spawnSync } from 'node:child_process';
+import { chmodSync, copyFileSync, mkdirSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+const here = dirname(fileURLToPath(import.meta.url));
+const pkgRoot = resolve(here, '..');
+const repoRoot = resolve(pkgRoot, '..', '..');
+const cargo = spawnSync('bash', ['-lc', 'source "$HOME/.cargo/env" 2>/dev/null || true; cargo build --release -p selfiek-core'], { cwd: repoRoot, stdio: 'inherit' });
+if (cargo.status !== 0) process.exit(cargo.status ?? 1);
+const src = resolve(repoRoot, 'target', 'release', process.platform === 'win32' ? 'selfiek-core.exe' : 'selfiek-core');
+const binDir = resolve(pkgRoot, 'bin');
+mkdirSync(binDir, { recursive: true });
+let destName;
+if (process.platform === 'linux' && process.arch === 'x64') destName = 'selfiek-core-linux-x64';
+else destName = `selfiek-core-${process.platform}-${process.arch}`;
+const dest = resolve(binDir, destName);
+copyFileSync(src, dest);
+chmodSync(dest, 0o755);
+console.log(`[selfiek] bundled ${dest}`);

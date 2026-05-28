@@ -1,0 +1,11 @@
+/target/
+/node_modules/
+**/node_modules/
+**/dist/
+**/*.tsbuildinfo
+packages/selfiek/bin/selfiek-core-*
+.DS_Store
+.env
+.env.*
+npm-debug.log*
+*.tgz
