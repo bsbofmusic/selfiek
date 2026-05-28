@@ -44,8 +44,8 @@ selfiek cleanup-used --json
 
 ## Version model
 
-- `runtime_version`: 3.6.0
-- `contract_version`: 3.6.0
+- `runtime_version`: 3.6.1
+- `contract_version`: 3.6.1
 
 SelfieK 3.6 upgrades prompt-library absorption: `library lint` validates the Obsidian recipe book, `library ingest` creates source/template drafts, `compile` emits `template_index.json`, `fragment_index.json`, `prompt_cards.jsonl`, `library_report.json`, and `weights.json`, and `draw/generate --use-templates` attach `prompt_card` v2 for feedback attribution. orderk is compile/report-only; production cron still consumes compiled artifacts and cdper remains the image-generation adapter.
 

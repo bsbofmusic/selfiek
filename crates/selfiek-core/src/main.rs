@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
-const VERSION: &str = "3.6.0";
+const VERSION: &str = "3.6.1";
 const REF_IMAGE_PREFIX: &str = "请直接生成一张全新的写实摄影风格图片，不要回复文字，不要解释。参考拼图包含 3 张同一角色照片，仅作为面部特征和发型气质参考。请完全忽略参考图中的服装、姿势、背景、光线和拍摄角度。你需要生成一个全新的、独立的场景和构图，只保留图中人物的稳定面部特征（脸型、五官比例、肤质、发色）。";
 const NEGATIVE_SUFFIX: &str = "\n\n[Important constraints] Must avoid: deformed fingers, extra fingers, fused fingers, backwards fingers, mutated hands, poorly drawn hands, malformed limbs, extra arms, extra legs, fused legs, too many fingers, long neck, distorted face, asymmetric eyes, cross-eyed, cloned face, ugly, disfigured, blurry, low quality, pixelated, watermark, text overlay, over-processed, plastic skin, waxy appearance, uncanny valley, AI artifacts, unrealistic proportions, cartoon, anime, 3d render.";
 
