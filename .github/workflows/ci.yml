@@ -9,6 +9,13 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    env:
+      SELFIEK_DICE_CONFIG: /tmp/selfiek-ci/dice_config.json
+      SELFIEK_K_ORIGINAL: /tmp/selfiek-ci/K-original
+      SELFIEK_NEW_DIR: /tmp/selfiek-ci/new
+      SELFIEK_USED_DIR: /tmp/selfiek-ci/used
+      SELFIEK_PROMPT_LIB: /tmp/selfiek-ci/prompt-lib
+      SELFIEK_RUNTIME_DIR: /tmp/selfiek-ci/runtime
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -16,8 +23,15 @@ jobs:
           node-version: '22'
           cache: 'npm'
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
       - run: npm ci
+      - run: node packages/selfiek/scripts/create-ci-fixture.mjs /tmp/selfiek-ci
+      - run: cargo clippy --workspace -- -D warnings
       - run: cargo test --workspace
       - run: npm run build --workspace selfiek
       - run: node packages/selfiek/dist/cli.js --version
+      - run: node packages/selfiek/dist/cli.js library lint --json
+      - run: node packages/selfiek/dist/cli.js compile --json
+      - run: node packages/selfiek/dist/cli.js generate --json --dry-run --use-templates
       - run: npm pack --workspace selfiek --dry-run

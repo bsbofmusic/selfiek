@@ -30,8 +30,11 @@ Override paths with flags or environment variables (`SELFIEK_K_ORIGINAL`, `SELFI
 selfiek --version
 selfiek status --json
 selfiek validate-config --json
+selfiek library lint --json
+selfiek library report --json
 selfiek compile --json
-selfiek draw --json --use-templates
+selfiek compile --use-orderk --json
+selfiek draw --json --use-templates --explain
 selfiek generate --json --dry-run --use-templates
 selfiek produce --json --use-templates --dry-run
 selfiek produce --json --use-templates --quiet
@@ -41,7 +44,7 @@ selfiek cleanup-used --json
 
 ## Version model
 
-- `runtime_version`: 3.5.0
-- `contract_version`: 3.5.0
+- `runtime_version`: 3.6.0
+- `contract_version`: 3.6.0
 
-SelfieK 3.5 activates the prompt-library compiler path at CLI level: `compile` creates `template_index.json` from Obsidian prompt templates, and `draw --use-templates` can attach matching prompt-card fragments. Production cron should switch only after local dry-run and live-generation smoke pass.
+SelfieK 3.6 upgrades prompt-library absorption: `library lint` validates the Obsidian recipe book, `library ingest` creates source/template drafts, `compile` emits `template_index.json`, `fragment_index.json`, `prompt_cards.jsonl`, `library_report.json`, and `weights.json`, and `draw/generate --use-templates` attach `prompt_card` v2 for feedback attribution. orderk is compile/report-only; production cron still consumes compiled artifacts and cdper remains the image-generation adapter.

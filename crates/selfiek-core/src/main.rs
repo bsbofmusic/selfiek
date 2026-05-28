@@ -6,14 +6,14 @@ use image::{DynamicImage, GenericImage, ImageBuffer, Rgb, RgbImage};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
-const VERSION: &str = "3.5.0";
+const VERSION: &str = "3.6.0";
 const REF_IMAGE_PREFIX: &str = "请直接生成一张全新的写实摄影风格图片，不要回复文字，不要解释。参考拼图包含 3 张同一角色照片，仅作为面部特征和发型气质参考。请完全忽略参考图中的服装、姿势、背景、光线和拍摄角度。你需要生成一个全新的、独立的场景和构图，只保留图中人物的稳定面部特征（脸型、五官比例、肤质、发色）。";
 const NEGATIVE_SUFFIX: &str = "\n\n[Important constraints] Must avoid: deformed fingers, extra fingers, fused fingers, backwards fingers, mutated hands, poorly drawn hands, malformed limbs, extra arms, extra legs, fused legs, too many fingers, long neck, distorted face, asymmetric eyes, cross-eyed, cloned face, ugly, disfigured, blurry, low quality, pixelated, watermark, text overlay, over-processed, plastic skin, waxy appearance, uncanny valley, AI artifacts, unrealistic proportions, cartoon, anime, 3d render.";
 
@@ -82,6 +82,12 @@ enum Commands {
     Compile {
         #[arg(long)]
         out: Option<PathBuf>,
+        #[arg(long)]
+        use_orderk: bool,
+    },
+    Library {
+        #[command(subcommand)]
+        command: LibraryCommands,
     },
     Draw {
         #[arg(long)]
@@ -92,6 +98,8 @@ enum Commands {
         outfit: Option<u32>,
         #[arg(long)]
         use_templates: bool,
+        #[arg(long)]
+        explain: bool,
     },
     Generate {
         #[arg(long)]
@@ -102,6 +110,8 @@ enum Commands {
         outfit: Option<u32>,
         #[arg(long)]
         use_templates: bool,
+        #[arg(long)]
+        explain: bool,
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
@@ -126,6 +136,20 @@ enum Commands {
         days: i64,
     },
     Version,
+}
+
+#[derive(Subcommand, Debug)]
+enum LibraryCommands {
+    Lint,
+    Report,
+    Ingest {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        apply: bool,
+    },
 }
 
 #[derive(Debug, Deserialize, Serialize, Clone)]
@@ -162,16 +186,51 @@ struct Outfit {
 struct TemplateEntry {
     path: String,
     id: String,
+    #[serde(default)]
+    schema_version: Option<String>,
+    #[serde(default)]
     name: Option<String>,
+    #[serde(default)]
     template_type: Option<String>,
+    #[serde(default)]
     scene_tags: Vec<String>,
+    #[serde(default)]
     style_tags: Vec<String>,
+    #[serde(default)]
     outfit_tags: Vec<String>,
+    #[serde(default)]
     mood_tags: Vec<String>,
+    #[serde(default)]
+    taxonomy_ids: Vec<String>,
+    #[serde(default)]
+    source_ids: Vec<String>,
+    #[serde(default)]
+    fragment_ids: Vec<String>,
+    #[serde(default)]
     fragment_texts: Vec<String>,
+    #[serde(default)]
     avoid: Vec<String>,
+    #[serde(default)]
+    use_mode: Option<String>,
+    #[serde(default)]
+    priority: Option<String>,
+    #[serde(default)]
     positive_weight: Option<String>,
+    #[serde(default)]
     negative_weight: Option<String>,
+}
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct FragmentEntry {
+    id: String,
+    path: String,
+    category: String,
+    text: String,
+    #[serde(default)]
+    text_en: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default)]
+    source_template_id: Option<String>,
 }
 #[derive(Debug, Serialize, Deserialize)]
 struct TemplateIndex {
@@ -181,6 +240,32 @@ struct TemplateIndex {
     source_dir: String,
     template_count: usize,
     templates: Vec<TemplateEntry>,
+}
+#[derive(Debug, Serialize, Deserialize)]
+struct FragmentIndex {
+    schema: String,
+    version: String,
+    generated_at: String,
+    source_dir: String,
+    fragment_count: usize,
+    fragments: Vec<FragmentEntry>,
+}
+#[derive(Debug, Clone)]
+struct LibraryScan {
+    source_count: usize,
+    template_count: usize,
+    v2_template_count: usize,
+    legacy_template_count: usize,
+    fragment_file_count: usize,
+    feedback_count: usize,
+    rule_count: usize,
+    image_file_count: usize,
+    templates: Vec<TemplateEntry>,
+    fragments: Vec<FragmentEntry>,
+    taxonomy_ids: HashSet<String>,
+    errors: Vec<Value>,
+    warnings: Vec<Value>,
+    legacy_templates: Vec<Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -219,12 +304,16 @@ fn run() -> Result<()> {
     match &cli.command {
         Commands::Status => emit(status(&cli)?, true),
         Commands::ValidateConfig => emit(validate_report(&cli.dice_config)?, true),
-        Commands::Compile { out } => emit(compile_templates(&cli, out.clone())?, true),
+        Commands::Compile { out, use_orderk } => {
+            emit(compile_templates(&cli, out.clone(), *use_orderk)?, true)
+        }
+        Commands::Library { command } => emit(library_command(&cli, command)?, true),
         Commands::Draw {
             scene,
             style,
             outfit,
             use_templates,
+            explain: _,
         } => emit(
             json!(draw(&cli, *scene, *style, *outfit, *use_templates)?),
             true,
@@ -234,6 +323,7 @@ fn run() -> Result<()> {
             style,
             outfit,
             use_templates,
+            explain: _,
             dry_run,
             quiet,
             out_dir,
@@ -497,115 +587,789 @@ fn yaml_value_to_json(v: serde_yaml::Value) -> Value {
     serde_json::to_value(v).unwrap_or(Value::Null)
 }
 
-fn compile_templates(cli: &Cli, out: Option<PathBuf>) -> Result<Value> {
-    let template_dir = cli.prompt_lib.join("templates");
-    let mut templates = vec![];
-    let mut skipped: Vec<Value> = vec![];
-    for path in yaml_files(&template_dir) {
+fn note_files(dir: &Path, recursive: bool) -> Vec<PathBuf> {
+    if !dir.exists() {
+        return vec![];
+    }
+    let mut walker = WalkDir::new(dir);
+    if !recursive {
+        walker = walker.max_depth(1);
+    }
+    let mut xs: Vec<_> = walker
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().to_path_buf())
+        .filter(|p| p.is_file())
+        .filter(|p| {
+            matches!(
+                p.extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "yaml" | "yml" | "md" | "txt"
+            )
+        })
+        .collect();
+    xs.sort();
+    xs
+}
+
+fn get_path_value<'a>(v: &'a Value, keys: &[&str]) -> Option<&'a Value> {
+    let mut cur = v;
+    for key in keys {
+        cur = cur.get(*key)?;
+    }
+    Some(cur)
+}
+
+fn nested_str_list(v: &Value, keys: &[&str]) -> Vec<String> {
+    get_path_value(v, keys)
+        .map(value_to_string_list)
+        .unwrap_or_default()
+}
+
+fn opt_str_at(v: &Value, keys: &[&str]) -> Option<String> {
+    get_path_value(v, keys)
+        .and_then(|x| x.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn dedupe_strings(xs: Vec<String>) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut out = Vec::new();
+    for x in xs {
+        let trimmed = x.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if seen.insert(trimmed.to_string()) {
+            out.push(trimmed.to_string());
+        }
+    }
+    out
+}
+
+fn collect_taxonomy_ids(j: &Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    for key in [
+        "scene_ids",
+        "style_ids",
+        "camera_ids",
+        "composition_ids",
+        "outfit_ids",
+        "mood_ids",
+        "effect_ids",
+    ] {
+        ids.extend(nested_str_list(j, &["taxonomy", key]));
+    }
+    ids.extend(str_list(j, "taxonomy_ids"));
+    dedupe_strings(ids)
+}
+
+fn collect_markdown_section(body: &str, section: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut in_section = false;
+    for line in body.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            let title = t.trim_start_matches('#').trim().to_ascii_lowercase();
+            in_section = title == section.to_ascii_lowercase();
+            continue;
+        }
+        if in_section {
+            if let Some(rest) = t.strip_prefix("- ") {
+                let x = rest.trim().trim_matches('"').trim_matches('\'');
+                if x.chars().count() >= 3 {
+                    out.push(x.to_string());
+                }
+            }
+        }
+    }
+    out
+}
+
+fn template_entry_from_document(path: &Path, j: &Value, body: &str) -> TemplateEntry {
+    let id = j
+        .get("id")
+        .and_then(|x| x.as_str())
+        .unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("unknown")
+        })
+        .to_string();
+    let mut fragments = Vec::new();
+    if let Some(x) = j.get("fragments") {
+        collect_strings(x, &mut fragments);
+    }
+    if let Some(x) = j.get("randomizable") {
+        collect_strings(x, &mut fragments);
+    }
+    fragments.extend(collect_markdown_section(body, "must keep"));
+    fragments.extend(collect_markdown_section(body, "optional"));
+    if fragments.is_empty() {
+        collect_markdown_fragments(body, &mut fragments);
+    }
+    let mut avoid = str_list(j, "avoid");
+    if let Some(x) = j.get("negative") {
+        collect_strings(x, &mut avoid);
+    }
+    if let Some(x) = j.get("negative_signal").and_then(|n| n.get("avoid")) {
+        collect_strings(x, &mut avoid);
+    }
+    avoid.extend(collect_markdown_section(body, "avoid"));
+    let mut source_ids = str_list(j, "source_ids");
+    if let Some(raw) = opt_str_at(j, &["source", "raw_prompt_path"]) {
+        if let Some(stem) = Path::new(&raw).file_stem().and_then(|s| s.to_str()) {
+            source_ids.push(stem.to_string());
+        }
+        source_ids.push(raw);
+    }
+    TemplateEntry {
+        path: path.to_string_lossy().to_string(),
+        id,
+        schema_version: j
+            .get("schema_version")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        name: j
+            .get("name")
+            .or_else(|| j.get("title"))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        template_type: j
+            .get("type")
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        scene_tags: dedupe_strings({
+            let mut xs = str_list(j, "scene_tags");
+            xs.extend(nested_str_list(j, &["taxonomy", "scene_ids"]));
+            xs
+        }),
+        style_tags: dedupe_strings({
+            let mut xs = str_list(j, "style_tags");
+            xs.extend(nested_str_list(j, &["taxonomy", "style_ids"]));
+            xs
+        }),
+        outfit_tags: dedupe_strings({
+            let mut xs = str_list(j, "outfit_tags");
+            xs.extend(nested_str_list(j, &["taxonomy", "outfit_ids"]));
+            xs
+        }),
+        mood_tags: dedupe_strings({
+            let mut xs = str_list(j, "mood_tags");
+            xs.extend(nested_str_list(j, &["taxonomy", "mood_ids"]));
+            xs
+        }),
+        taxonomy_ids: collect_taxonomy_ids(j),
+        source_ids: dedupe_strings(source_ids),
+        fragment_ids: vec![],
+        fragment_texts: dedupe_strings(fragments).into_iter().take(40).collect(),
+        avoid: dedupe_strings(avoid).into_iter().take(32).collect(),
+        use_mode: opt_str_at(j, &["compiler", "use_mode"]).or_else(|| opt_str_at(j, &["use_mode"])),
+        priority: opt_str_at(j, &["compiler", "priority"]).or_else(|| opt_str_at(j, &["priority"])),
+        positive_weight: j
+            .get("positive_signal")
+            .and_then(|p| p.get("weight"))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+        negative_weight: j
+            .get("negative_signal")
+            .and_then(|p| p.get("weight"))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string()),
+    }
+}
+
+fn fragment_entry_from_document(path: &Path, j: &Value, body: &str) -> Option<FragmentEntry> {
+    let id = j
+        .get("id")
+        .and_then(|x| x.as_str())
+        .or_else(|| path.file_stem().and_then(|s| s.to_str()))?
+        .to_string();
+    let category = j
+        .get("category")
+        .and_then(|x| x.as_str())
+        .map(|s| s.to_string())
+        .or_else(|| {
+            path.parent()
+                .and_then(|p| p.file_name())
+                .and_then(|s| s.to_str())
+                .map(|s| s.to_string())
+        })
+        .unwrap_or_else(|| "fragment".into());
+    let text = opt_str_at(j, &["text_zh"])
+        .or_else(|| opt_str_at(j, &["text"]))
+        .or_else(|| {
+            collect_markdown_fragments(body, &mut Vec::new());
+            body.lines()
+                .find(|line| !line.trim().is_empty() && !line.trim().starts_with('#'))
+                .map(|s| s.trim().to_string())
+        })?;
+    Some(FragmentEntry {
+        id,
+        path: path.to_string_lossy().to_string(),
+        category,
+        text,
+        text_en: opt_str_at(j, &["text_en"]),
+        tags: str_list(j, "tags"),
+        source_template_id: opt_str_at(j, &["source_template_id"]),
+    })
+}
+
+fn collect_all_string_atoms(v: &Value, out: &mut Vec<String>) {
+    match v {
+        Value::String(s) => out.push(s.clone()),
+        Value::Array(a) => {
+            for x in a {
+                collect_all_string_atoms(x, out);
+            }
+        }
+        Value::Object(m) => {
+            for (k, x) in m {
+                out.push(k.clone());
+                collect_all_string_atoms(x, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn load_taxonomy_ids(prompt_lib: &Path) -> Result<HashSet<String>> {
+    let mut ids = HashSet::new();
+    let path = prompt_lib.join("rules").join("taxonomy.yaml");
+    if !path.exists() {
+        return Ok(ids);
+    }
+    let txt = fs::read_to_string(&path)?;
+    let y: serde_yaml::Value =
+        serde_yaml::from_str(&txt).with_context(|| format!("parse taxonomy {}", path.display()))?;
+    let j = yaml_value_to_json(y);
+    let mut atoms = Vec::new();
+    collect_all_string_atoms(&j, &mut atoms);
+    for atom in atoms {
+        let a = atom.trim();
+        if a.contains('.') && !a.contains(' ') {
+            ids.insert(a.to_string());
+        }
+    }
+    Ok(ids)
+}
+
+fn resolve_library_ref(prompt_lib: &Path, raw: &str) -> bool {
+    let p = Path::new(raw);
+    if p.is_absolute() && p.exists() {
+        return true;
+    }
+    if prompt_lib.join(raw).exists() {
+        return true;
+    }
+    if let Some(stripped) = raw.strip_prefix("raw/selfie-prompts/") {
+        if prompt_lib.join(stripped).exists() {
+            return true;
+        }
+    }
+    let vault_root = prompt_lib
+        .parent()
+        .and_then(|p| p.parent())
+        .unwrap_or(prompt_lib);
+    vault_root.join(raw).exists()
+}
+
+fn contains_boundary_noise(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    [
+        "nsfw",
+        "nudity",
+        "sexual content",
+        "sexual",
+        "cleavage",
+        "revealing",
+        "see-through",
+        "suggestive",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
+fn library_scan(cli: &Cli) -> Result<LibraryScan> {
+    let root = &cli.prompt_lib;
+    let mut scan = LibraryScan {
+        source_count: note_files(&root.join("sources"), true).len(),
+        template_count: 0,
+        v2_template_count: 0,
+        legacy_template_count: 0,
+        fragment_file_count: note_files(&root.join("fragments"), true).len(),
+        feedback_count: note_files(&root.join("feedback"), true).len(),
+        rule_count: note_files(&root.join("rules"), true).len(),
+        image_file_count: image_files(root).len(),
+        templates: vec![],
+        fragments: vec![],
+        taxonomy_ids: load_taxonomy_ids(root)?,
+        errors: vec![],
+        warnings: vec![],
+        legacy_templates: vec![],
+    };
+    if !root.exists() {
+        scan.errors
+            .push(json!({"code":"missing_prompt_lib","path":root}));
+        return Ok(scan);
+    }
+    if scan.image_file_count > 0 {
+        scan.errors.push(json!({"code":"image_files_inside_prompt_lib","count":scan.image_file_count,"message":"K original/reference images must stay outside Obsidian prompt library"}));
+    }
+    if scan.taxonomy_ids.is_empty() {
+        scan.warnings.push(
+            json!({"code":"missing_or_empty_taxonomy","path":root.join("rules/taxonomy.yaml")}),
+        );
+    }
+    if !root.join("rules/safety.yaml").exists() {
+        scan.warnings
+            .push(json!({"code":"missing_safety_rules","path":root.join("rules/safety.yaml")}));
+    }
+
+    let mut template_ids = HashSet::new();
+    for path in yaml_files(&root.join("templates")) {
         let txt = fs::read_to_string(&path)?;
         let (j, body) = match parse_template_document(&txt, &path) {
             Ok(v) => v,
             Err(e) => {
-                skipped.push(json!({"path": path, "error": e.to_string()}));
+                scan.errors.push(
+                    json!({"code":"parse_template_failed","path":path,"error":e.to_string()}),
+                );
                 continue;
             }
         };
-        let mut fragments = vec![];
-        if let Some(x) = j.get("fragments") {
-            collect_strings(x, &mut fragments);
+        let entry = template_entry_from_document(&path, &j, &body);
+        if !template_ids.insert(entry.id.clone()) {
+            scan.errors
+                .push(json!({"code":"duplicate_template_id","id":entry.id,"path":path}));
         }
-        if let Some(x) = j.get("randomizable") {
-            collect_strings(x, &mut fragments);
+        match entry.schema_version.as_deref() {
+            Some("selfiek.template.v2") => {
+                scan.v2_template_count += 1;
+                let entry_type = entry.template_type.as_deref().unwrap_or("");
+                let is_feedback = matches!(entry_type, "positive_feedback" | "negative_feedback");
+                if entry.use_mode.is_none() && !is_feedback {
+                    scan.errors.push(
+                        json!({"code":"missing_compiler_use_mode","id":entry.id,"path":path}),
+                    );
+                }
+                if entry.source_ids.is_empty() && !is_feedback {
+                    scan.errors
+                        .push(json!({"code":"missing_raw_source_link","id":entry.id,"path":path}));
+                } else if let Some(raw) = opt_str_at(&j, &["source", "raw_prompt_path"]) {
+                    if !resolve_library_ref(root, &raw) {
+                        scan.errors.push(json!({"code":"raw_source_missing","id":entry.id,"raw_prompt_path":raw,"path":path}));
+                    }
+                }
+                if is_feedback {
+                    if opt_str_at(&j, &["source", "source_image"]).is_none()
+                        || opt_str_at(&j, &["source", "source_metadata"]).is_none()
+                    {
+                        scan.errors.push(json!({"code":"feedback_missing_image_or_metadata","id":entry.id,"path":path}));
+                    }
+                    if get_path_value(&j, &["source", "visual_checked"]).and_then(|x| x.as_bool())
+                        != Some(true)
+                    {
+                        scan.errors.push(json!({"code":"feedback_requires_visual_checked","id":entry.id,"path":path}));
+                    }
+                }
+                if !scan.taxonomy_ids.is_empty() {
+                    for tax in &entry.taxonomy_ids {
+                        if !scan.taxonomy_ids.contains(tax) {
+                            scan.errors.push(json!({"code":"unknown_taxonomy_id","id":entry.id,"taxonomy_id":tax,"path":path}));
+                        }
+                    }
+                }
+            }
+            _ => {
+                scan.legacy_template_count += 1;
+                scan.legacy_templates
+                    .push(json!({"id":entry.id,"path":path,"warning":"legacy_needs_migration"}));
+            }
         }
-        collect_markdown_fragments(&body, &mut fragments);
-        let mut avoid = str_list(&j, "avoid");
-        if let Some(x) = j.get("negative") {
-            collect_strings(x, &mut avoid);
+        for text in entry.fragment_texts.iter().chain(entry.avoid.iter()) {
+            if contains_boundary_noise(text) {
+                scan.warnings.push(json!({"code":"boundary_noise_in_library_text","id":entry.id,"path":path,"message":"kept as library metadata only; generation prompt uses SelfieK safe negative suffix"}));
+                break;
+            }
         }
-        if let Some(x) = j.get("negative_signal").and_then(|n| n.get("avoid")) {
-            collect_strings(x, &mut avoid);
-        }
-        let entry = TemplateEntry {
-            path: path.to_string_lossy().to_string(),
-            id: j
-                .get("id")
-                .and_then(|x| x.as_str())
-                .unwrap_or_else(|| {
-                    path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("unknown")
-                })
-                .to_string(),
-            name: j
-                .get("name")
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string()),
-            template_type: j
-                .get("type")
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string()),
-            scene_tags: str_list(&j, "scene_tags"),
-            style_tags: str_list(&j, "style_tags"),
-            outfit_tags: str_list(&j, "outfit_tags"),
-            mood_tags: str_list(&j, "mood_tags"),
-            fragment_texts: fragments
-                .into_iter()
-                .filter(|s| !s.trim().is_empty())
-                .take(24)
-                .collect(),
-            avoid: avoid
-                .into_iter()
-                .filter(|s| !s.trim().is_empty())
-                .take(24)
-                .collect(),
-            positive_weight: j
-                .get("positive_signal")
-                .and_then(|p| p.get("weight"))
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string()),
-            negative_weight: j
-                .get("negative_signal")
-                .and_then(|p| p.get("weight"))
-                .and_then(|x| x.as_str())
-                .map(|s| s.to_string()),
-        };
-        templates.push(entry);
+        scan.templates.push(entry);
     }
-    let index = TemplateIndex {
-        schema: "selfiek.template_index.v1".into(),
-        version: VERSION.into(),
-        generated_at: Utc::now().to_rfc3339(),
-        source_dir: template_dir.to_string_lossy().to_string(),
-        template_count: templates.len(),
-        templates,
+    scan.template_count = scan.templates.len();
+
+    let mut fragment_ids = HashSet::new();
+    for path in note_files(&root.join("fragments"), true) {
+        let txt = fs::read_to_string(&path)?;
+        let (j, body) = match parse_template_document(&txt, &path) {
+            Ok(v) => v,
+            Err(e) => {
+                scan.errors.push(
+                    json!({"code":"parse_fragment_failed","path":path,"error":e.to_string()}),
+                );
+                continue;
+            }
+        };
+        let Some(entry) = fragment_entry_from_document(&path, &j, &body) else {
+            scan.errors.push(json!({"code":"invalid_fragment","path":path,"message":"fragment requires id/category/text"}));
+            continue;
+        };
+        if !fragment_ids.insert(entry.id.clone()) {
+            scan.errors
+                .push(json!({"code":"duplicate_fragment_id","id":entry.id,"path":path}));
+        }
+        scan.fragments.push(entry);
+    }
+    for template in &scan.templates {
+        for (idx, text) in template.fragment_texts.iter().enumerate() {
+            let id = format!("{}.fragment.{:03}", template.id, idx + 1);
+            if fragment_ids.insert(id.clone()) {
+                scan.fragments.push(FragmentEntry {
+                    id,
+                    path: template.path.clone(),
+                    category: "template".into(),
+                    text: text.clone(),
+                    text_en: None,
+                    tags: dedupe_strings(
+                        template
+                            .scene_tags
+                            .iter()
+                            .chain(template.style_tags.iter())
+                            .chain(template.outfit_tags.iter())
+                            .cloned()
+                            .collect(),
+                    ),
+                    source_template_id: Some(template.id.clone()),
+                });
+            }
+        }
+    }
+    Ok(scan)
+}
+
+fn library_lint(cli: &Cli) -> Result<Value> {
+    let scan = library_scan(cli)?;
+    Ok(json!({
+        "ok": scan.errors.is_empty(),
+        "schema":"selfiek.library_lint.v1",
+        "version": VERSION,
+        "prompt_lib": cli.prompt_lib,
+        "counts": {
+            "sources": scan.source_count,
+            "templates": scan.template_count,
+            "templates_v2": scan.v2_template_count,
+            "templates_legacy": scan.legacy_template_count,
+            "fragment_files": scan.fragment_file_count,
+            "compiled_fragments": scan.fragments.len(),
+            "feedback": scan.feedback_count,
+            "rules": scan.rule_count
+        },
+        "errors": scan.errors,
+        "warnings": scan.warnings,
+        "legacy_needs_migration": scan.legacy_templates
+    }))
+}
+
+fn orderk_probe(use_orderk: bool) -> Value {
+    if !use_orderk {
+        return json!({"requested":false,"available":false,"skipped":"not requested"});
+    }
+    let bin = if Path::new("/home/agent/.local/bin/orderk").exists() {
+        "/home/agent/.local/bin/orderk"
+    } else {
+        "orderk"
     };
-    let out_path = out.unwrap_or_else(|| cli.runtime_dir.join("template_index.json"));
-    write_json_atomic(&out_path, &serde_json::to_value(&index)?)?;
+    match Command::new(bin).output() {
+        Ok(out) => json!({
+            "requested": true,
+            "available": out.status.success(),
+            "mode":"compile_report_only",
+            "command": bin,
+            "stdout_sample": String::from_utf8_lossy(&out.stdout).chars().take(240).collect::<String>(),
+            "stderr_sample": String::from_utf8_lossy(&out.stderr).chars().take(240).collect::<String>()
+        }),
+        Err(e) => {
+            json!({"requested":true,"available":false,"mode":"compile_report_only","error":e.to_string()})
+        }
+    }
+}
+
+fn write_jsonl_atomic(path: &Path, rows: &[Value]) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let tmp = path.with_extension("jsonltmp");
+    let mut f = File::create(&tmp)?;
+    for row in rows {
+        f.write_all(serde_json::to_string(row)?.as_bytes())?;
+        f.write_all(b"\n")?;
+    }
+    f.sync_all().ok();
+    fs::rename(tmp, path)?;
+    Ok(())
+}
+
+fn build_prompt_card_for_template(t: &TemplateEntry) -> Value {
+    let fragment_ids: Vec<String> = (0..t.fragment_texts.len().min(8))
+        .map(|idx| format!("{}.fragment.{:03}", t.id, idx + 1))
+        .collect();
+    json!({
+        "schema_version":"selfiek.prompt_card.v2",
+        "template_ids":[t.id.clone()],
+        "fragment_ids":fragment_ids,
+        "source_ids":t.source_ids,
+        "k_image_ids":[],
+        "taxonomy_ids":t.taxonomy_ids,
+        "weights_applied":[],
+        "negative_rules":t.avoid.iter().take(8).cloned().collect::<Vec<_>>(),
+        "fragments":t.fragment_texts.iter().take(8).cloned().collect::<Vec<_>>(),
+        "template_path":t.path,
+        "use_mode":t.use_mode,
+        "priority":t.priority
+    })
+}
+
+fn library_report_value(cli: &Cli, use_orderk: bool) -> Result<Value> {
+    let scan = library_scan(cli)?;
+    Ok(json!({
+        "ok": scan.errors.is_empty(),
+        "schema":"selfiek.library_report.v1",
+        "version": VERSION,
+        "generated_at": Utc::now().to_rfc3339(),
+        "prompt_lib": cli.prompt_lib,
+        "runtime_dir": cli.runtime_dir,
+        "orderk": orderk_probe(use_orderk),
+        "counts": {
+            "sources": scan.source_count,
+            "templates": scan.template_count,
+            "templates_v2": scan.v2_template_count,
+            "templates_legacy": scan.legacy_template_count,
+            "fragments": scan.fragments.len(),
+            "fragment_files": scan.fragment_file_count,
+            "feedback": scan.feedback_count,
+            "rules": scan.rule_count
+        },
+        "warnings": scan.warnings,
+        "errors": scan.errors,
+        "legacy_needs_migration": scan.legacy_templates
+    }))
+}
+
+fn compile_templates(cli: &Cli, out: Option<PathBuf>, use_orderk: bool) -> Result<Value> {
+    ensure_dirs(cli)?;
+    let scan = library_scan(cli)?;
+    let generated_at = Utc::now().to_rfc3339();
+    let template_index = TemplateIndex {
+        schema: "selfiek.template_index.v2".into(),
+        version: VERSION.into(),
+        generated_at: generated_at.clone(),
+        source_dir: cli
+            .prompt_lib
+            .join("templates")
+            .to_string_lossy()
+            .to_string(),
+        template_count: scan.templates.len(),
+        templates: scan.templates.clone(),
+    };
+    let fragment_index = FragmentIndex {
+        schema: "selfiek.fragment_index.v1".into(),
+        version: VERSION.into(),
+        generated_at: generated_at.clone(),
+        source_dir: cli
+            .prompt_lib
+            .join("fragments")
+            .to_string_lossy()
+            .to_string(),
+        fragment_count: scan.fragments.len(),
+        fragments: scan.fragments.clone(),
+    };
+    let cards: Vec<Value> = scan
+        .templates
+        .iter()
+        .filter(|t| !t.fragment_texts.is_empty())
+        .map(build_prompt_card_for_template)
+        .collect();
+    let weights = json!({
+        "schema":"selfiek.weights.v1",
+        "version":VERSION,
+        "generated_at":generated_at,
+        "positive_templates": scan.templates.iter().filter(|t| t.positive_weight.is_some()).map(|t| t.id.clone()).collect::<Vec<_>>(),
+        "negative_templates": scan.templates.iter().filter(|t| t.negative_weight.is_some()).map(|t| t.id.clone()).collect::<Vec<_>>(),
+        "note":"v3.6 keeps runtime deterministic; feedback weights are metadata until a later scorer uses them"
+    });
+    let template_out = out.unwrap_or_else(|| cli.runtime_dir.join("template_index.json"));
+    let fragment_out = cli.runtime_dir.join("fragment_index.json");
+    let cards_out = cli.runtime_dir.join("prompt_cards.jsonl");
+    let report_out = cli.runtime_dir.join("library_report.json");
+    let weights_out = cli.runtime_dir.join("weights.json");
+    write_json_atomic(&template_out, &serde_json::to_value(&template_index)?)?;
+    write_json_atomic(&fragment_out, &serde_json::to_value(&fragment_index)?)?;
+    write_jsonl_atomic(&cards_out, &cards)?;
+    let report = library_report_value(cli, use_orderk)?;
+    write_json_atomic(&report_out, &report)?;
+    write_json_atomic(&weights_out, &weights)?;
+    Ok(json!({
+        "ok": scan.errors.is_empty(),
+        "schema":"selfiek.compile.v2",
+        "version": VERSION,
+        "out": template_out,
+        "artifacts": {
+            "template_index": template_out,
+            "fragment_index": fragment_out,
+            "prompt_cards": cards_out,
+            "library_report": report_out,
+            "weights": weights_out
+        },
+        "template_count": template_index.template_count,
+        "fragment_count": fragment_index.fragment_count,
+        "prompt_card_count": cards.len(),
+        "warning_count": scan.warnings.len(),
+        "error_count": scan.errors.len(),
+        "warnings": scan.warnings,
+        "errors": scan.errors,
+        "orderk": orderk_probe(use_orderk)
+    }))
+}
+
+fn sanitize_slug(s: &str) -> String {
+    let mut out = String::new();
+    for ch in s.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+        } else if matches!(ch, '-' | '_' | ' ' | '.') && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    let out = out.trim_matches('-').to_string();
+    if out.is_empty() {
+        "prompt".into()
+    } else {
+        out
+    }
+}
+
+fn ingest_inputs(source: &Path) -> Vec<PathBuf> {
+    if source.is_file() {
+        return vec![source.to_path_buf()];
+    }
+    note_files(source, true)
+}
+
+fn library_ingest(cli: &Cli, source: &Path, dry_run: bool, apply: bool) -> Result<Value> {
+    if dry_run == apply {
+        bail!("choose exactly one of --dry-run or --apply");
+    }
+    let files = ingest_inputs(source);
+    let date = Local::now().format("%Y%m%d").to_string();
+    let mut actions = Vec::new();
+    for path in files {
+        let raw = fs::read_to_string(&path)
+            .with_context(|| format!("read ingest source {}", path.display()))?;
+        let base = sanitize_slug(
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("prompt"),
+        );
+        let src_id = format!("src-{}-{}", base, date);
+        let tpl_id = format!("tpl-{}-{}", base, date);
+        let src_rel = format!("sources/{}.md", src_id);
+        let tpl_rel = format!("templates/{}.md", tpl_id);
+        let source_note = format!(
+            "---\nschema_version: selfiek.source.v1\nid: {}\nstatus: active\ntype: raw_prompt_source\norigin: user\ncreated_at: \"{}\"\nlicense_scope: personal_selfiek\n---\n\n# {}\n\n## Raw Prompt\n\n{}\n",
+            src_id,
+            Local::now().to_rfc3339(),
+            base,
+            raw
+        );
+        let template_note = format!(
+            "---\nschema_version: selfiek.template.v2\nid: {}\ntitle: {}\nstatus: draft\ntype: prompt_template\nsource:\n  raw_prompt_path: raw/selfie-prompts/{}\n  origin: user\n  confidence: needs_review\ntaxonomy:\n  scene_ids: []\n  style_ids: []\n  camera_ids: []\n  composition_ids: []\n  outfit_ids: []\n  mood_ids: []\ncompiler:\n  use_mode: fragments\n  priority: normal\n  max_fragments_per_card: 4\n  avoid_full_prompt_copy: true\ncompatibility:\n  preferred_scene_ids: []\n  forbidden_scene_ids: []\nsafety:\n  boundary: daily_fashion\n  avoid_oversexualization: true\ntaxonomy_needs_review: true\n---\n\n# {}\n\n## Summary\n- Draft imported by `selfiek library ingest`; taxonomy needs human review.\n\n## Must Keep\n- Preserve the source prompt intent after review.\n\n## Optional\n- Split reusable camera, lighting, pose, outfit, mood, and effect fragments here.\n\n## Avoid\n- Do not copy the raw prompt wholesale into runtime generation.\n",
+            tpl_id, base, src_rel, base
+        );
+        if apply {
+            let src_path = cli.prompt_lib.join(&src_rel);
+            let tpl_path = cli.prompt_lib.join(&tpl_rel);
+            if let Some(parent) = src_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            if let Some(parent) = tpl_path.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            let mut src_file = File::options()
+                .write(true)
+                .create_new(true)
+                .open(&src_path)
+                .with_context(|| {
+                    format!(
+                        "create new source note without clobbering {}",
+                        src_path.display()
+                    )
+                })?;
+            src_file.write_all(source_note.as_bytes())?;
+            let mut tpl_file = File::options()
+                .write(true)
+                .create_new(true)
+                .open(&tpl_path)
+                .with_context(|| {
+                    format!(
+                        "create new template note without clobbering {}",
+                        tpl_path.display()
+                    )
+                })?;
+            tpl_file.write_all(template_note.as_bytes())?;
+        }
+        actions.push(json!({"input":path,"source_note":cli.prompt_lib.join(&src_rel),"template_note":cli.prompt_lib.join(&tpl_rel)}));
+    }
     Ok(
-        json!({"ok": skipped.is_empty(), "out": out_path, "template_count": index.template_count, "skipped_count": skipped.len(), "skipped": skipped, "schema": index.schema, "version": VERSION}),
+        json!({"ok":true,"dry_run":dry_run,"applied":apply,"source":source,"count":actions.len(),"actions":actions}),
     )
 }
 
+fn library_command(cli: &Cli, command: &LibraryCommands) -> Result<Value> {
+    match command {
+        LibraryCommands::Lint => library_lint(cli),
+        LibraryCommands::Report => library_report_value(cli, false),
+        LibraryCommands::Ingest {
+            source,
+            dry_run,
+            apply,
+        } => library_ingest(cli, source, *dry_run, *apply),
+    }
+}
 fn load_template_index(cli: &Cli) -> Option<TemplateIndex> {
     read_json_file(&cli.runtime_dir.join("template_index.json")).ok()
 }
+fn token_match(hay: &str, tag: &str) -> bool {
+    let hay_l = hay.to_ascii_lowercase();
+    let tag_l = tag.to_ascii_lowercase();
+    if hay.contains(tag) || hay_l.contains(&tag_l) {
+        return true;
+    }
+    tag_l
+        .split(['.', '_', '-', ' '])
+        .filter(|part| part.chars().count() >= 4)
+        .any(|part| hay_l.contains(part))
+}
+
 fn template_score(t: &TemplateEntry, scene: &Scene, style: &Style, outfit: &Outfit) -> i32 {
     let hay_scene = format!("{} {}", scene.name, scene.prompt);
     let hay_style = format!("{} {}", style.name, style.prompt);
     let hay_outfit = format!("{} {}", outfit.name, outfit.prompt);
     let mut score = 0;
     for tag in &t.scene_tags {
-        if hay_scene.contains(tag) {
+        if token_match(&hay_scene, tag) {
             score += 4;
         }
     }
     for tag in &t.style_tags {
-        if hay_style.contains(tag) {
+        if token_match(&hay_style, tag) {
             score += 3;
         }
     }
     for tag in &t.outfit_tags {
-        if hay_outfit.contains(tag) {
+        if token_match(&hay_outfit, tag) {
             score += 2;
         }
     }
@@ -627,11 +1391,26 @@ fn choose_template_card(cli: &Cli, scene: &Scene, style: &Style, outfit: &Outfit
         .filter(|(s, _)| *s > 0)
         .collect();
     scored.sort_by_key(|item| std::cmp::Reverse(item.0));
-    let best = scored.first()?.1;
+    let (score, best) = scored.first()?;
     let fragments: Vec<_> = best.fragment_texts.iter().take(6).cloned().collect();
-    Some(
-        json!({"schema":"selfiek.prompt_card.v1", "template_id": best.id, "template_path": best.path, "score": scored.first().map(|x| x.0).unwrap_or(0), "fragments": fragments, "avoid": best.avoid.iter().take(6).cloned().collect::<Vec<_>>() }),
-    )
+    let fragment_ids: Vec<_> = (0..fragments.len())
+        .map(|idx| format!("{}.fragment.{:03}", best.id, idx + 1))
+        .collect();
+    Some(json!({
+        "schema_version":"selfiek.prompt_card.v2",
+        "template_ids":[best.id.clone()],
+        "fragment_ids":fragment_ids,
+        "source_ids":best.source_ids,
+        "k_image_ids":[],
+        "taxonomy_ids":best.taxonomy_ids,
+        "weights_applied":[],
+        "negative_rules":best.avoid.iter().take(6).cloned().collect::<Vec<_>>(),
+        "fragments": fragments,
+        "template_path": best.path,
+        "score": score,
+        "use_mode": best.use_mode,
+        "priority": best.priority
+    }))
 }
 
 fn draw(
@@ -1103,6 +1882,124 @@ mod tests {
             str_list(&j, "scene_tags"),
             vec!["海边".to_string(), "沙滩".to_string()]
         );
+    }
+
+    fn temp_path(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "selfiek-test-{}-{}",
+            name,
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ))
+    }
+
+    fn write_fixture_library(root: &Path) {
+        fs::create_dir_all(root.join("sources")).unwrap();
+        fs::create_dir_all(root.join("templates")).unwrap();
+        fs::create_dir_all(root.join("fragments/effect")).unwrap();
+        fs::create_dir_all(root.join("rules")).unwrap();
+        fs::write(
+            root.join("sources/src-demo.md"),
+            "---\nschema_version: selfiek.source.v1\nid: src-demo\nstatus: active\ntype: raw_prompt_source\n---\n\n## Raw Prompt\nraw text",
+        ).unwrap();
+        fs::write(
+            root.join("rules/taxonomy.yaml"),
+            "scenes:\n  - id: scene.concert\nstyles:\n  - id: style.candid_snapshot\ncameras:\n  - id: camera.phone\ncompositions:\n  - id: composition.closeup\noutfits:\n  - id: outfit.casual\nmoods:\n  - id: mood.energetic\neffects:\n  - id: effect.stage_light\n",
+        ).unwrap();
+        fs::write(
+            root.join("rules/safety.yaml"),
+            "schema_version: selfiek.safety.v1\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("fragments/effect/stage-light.yaml"),
+            "schema_version: selfiek.fragment.v1\nid: effect.stage_light\ncategory: effect\ntext_zh: 彩色舞台灯扫过脸侧\ntags: [concert]\n",
+        ).unwrap();
+        fs::write(
+            root.join("templates/tpl-demo.md"),
+            "---\nschema_version: selfiek.template.v2\nid: tpl-demo\ntitle: 演唱会抓拍\nstatus: active\ntype: prompt_template\nsource:\n  raw_prompt_path: sources/src-demo.md\ntaxonomy:\n  scene_ids: [scene.concert]\n  style_ids: [style.candid_snapshot]\n  camera_ids: [camera.phone]\n  composition_ids: [composition.closeup]\n  outfit_ids: [outfit.casual]\n  mood_ids: [mood.energetic]\n  effect_ids: [effect.stage_light]\ncompiler:\n  use_mode: fragments\n  priority: high\n---\n\n# 演唱会抓拍\n\n## Must Keep\n- 彩色舞台灯扫过脸侧\n- 人群背景里有荧光棒\n\n## Avoid\n- 专业棚拍感\n",
+        ).unwrap();
+    }
+
+    #[test]
+    fn scans_v2_library_and_builds_prompt_card() {
+        let root = temp_path("library");
+        write_fixture_library(&root);
+        let cli = Cli {
+            dice_config: root.join("dice.json"),
+            k_original: root.join("k"),
+            new_dir: root.join("new"),
+            used_dir: root.join("used"),
+            prompt_lib: root.clone(),
+            runtime_dir: root.join("runtime"),
+            cdper_bin: PathBuf::from("cdper-gpt-image"),
+            json: true,
+            command: Commands::Status,
+        };
+        let lint = library_lint(&cli).unwrap();
+        assert_eq!(lint.get("ok").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(lint["counts"]["templates_v2"].as_u64(), Some(1));
+        let compiled = compile_templates(&cli, None, false).unwrap();
+        assert_eq!(compiled.get("ok").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(compiled["prompt_card_count"].as_u64(), Some(1));
+        let index: TemplateIndex =
+            read_json_file(&root.join("runtime/template_index.json")).unwrap();
+        let card = choose_template_card(
+            &cli,
+            &Scene {
+                id: 1,
+                name: "🎤 演唱会现场".into(),
+                prompt: "演唱会 舞台灯 荧光棒".into(),
+                openings: vec!["hi".into()],
+            },
+            &Style {
+                id: 4,
+                name: "抓拍".into(),
+                prompt: "candid snapshot phone".into(),
+            },
+            &Outfit {
+                id: 1,
+                name: "休闲".into(),
+                prompt: "casual".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(index.template_count, 1);
+        assert_eq!(
+            card["schema_version"].as_str(),
+            Some("selfiek.prompt_card.v2")
+        );
+        assert!(card["template_ids"].as_array().unwrap()[0]
+            .as_str()
+            .unwrap()
+            .contains("tpl-demo"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn ingest_apply_refuses_to_clobber_existing_notes() {
+        let root = temp_path("ingest");
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("raw.txt");
+        fs::write(&input, "a reusable concert prompt").unwrap();
+        let cli = Cli {
+            dice_config: root.join("dice.json"),
+            k_original: root.join("k"),
+            new_dir: root.join("new"),
+            used_dir: root.join("used"),
+            prompt_lib: root.join("prompt-lib"),
+            runtime_dir: root.join("runtime"),
+            cdper_bin: PathBuf::from("cdper-gpt-image"),
+            json: true,
+            command: Commands::Status,
+        };
+        let first = library_ingest(&cli, &input, false, true).unwrap();
+        assert_eq!(first.get("ok").and_then(|x| x.as_bool()), Some(true));
+        let second = library_ingest(&cli, &input, false, true);
+        assert!(
+            second.is_err(),
+            "second ingest must not overwrite existing notes"
+        );
+        fs::remove_dir_all(root).ok();
     }
 
     #[test]

@@ -12,14 +12,33 @@ permissions:
 jobs:
   publish:
     runs-on: ubuntu-latest
+    env:
+      SELFIEK_DICE_CONFIG: /tmp/selfiek-ci/dice_config.json
+      SELFIEK_K_ORIGINAL: /tmp/selfiek-ci/K-original
+      SELFIEK_NEW_DIR: /tmp/selfiek-ci/new
+      SELFIEK_USED_DIR: /tmp/selfiek-ci/used
+      SELFIEK_PROMPT_LIB: /tmp/selfiek-ci/prompt-lib
+      SELFIEK_RUNTIME_DIR: /tmp/selfiek-ci/runtime
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
           registry-url: 'https://registry.npmjs.org'
+      - name: Use npm with OIDC support
+        run: npm install -g npm@latest
       - uses: dtolnay/rust-toolchain@stable
       - run: npm ci
+      - run: node packages/selfiek/scripts/create-ci-fixture.mjs /tmp/selfiek-ci
+      - run: cargo test --workspace
       - run: npm run build --workspace selfiek
+      - run: npm test --workspace selfiek
       - run: npm pack --workspace selfiek --dry-run
-      - run: npm publish --workspace selfiek --access public
+      - name: Publish selfiek to npm
+        run: |
+          VERSION=$(node -p "require('./packages/selfiek/package.json').version")
+          if npm view selfiek@"$VERSION" version >/dev/null 2>&1; then
+            echo "selfiek@$VERSION already exists on npm; skipping publish"
+          else
+            npm publish --workspace selfiek --access public
+          fi

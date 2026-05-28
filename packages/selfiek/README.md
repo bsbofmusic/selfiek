@@ -1,13 +1,16 @@
 # selfiek
 
-`selfiek` is the npm CLI for SelfieK 3.5.
+`selfiek` is the npm CLI for SelfieK 3.6.
 
 ```bash
 npm install -g selfiek
 selfiek status --json
 selfiek validate-config --json
+selfiek library lint --json
+selfiek library report --json
 selfiek compile --json
-selfiek draw --json --use-templates
+selfiek compile --use-orderk --json
+selfiek draw --json --use-templates --explain
 selfiek generate --json --dry-run --use-templates
 selfiek produce --json --use-templates --dry-run
 selfiek produce --json --use-templates --quiet

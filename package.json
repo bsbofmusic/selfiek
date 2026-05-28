@@ -1,8 +1,10 @@
 {
   "name": "selfiek-monorepo",
   "private": true,
-  "version": "3.5.0",
-  "workspaces": ["packages/selfiek"],
+  "version": "3.6.0",
+  "workspaces": [
+    "packages/selfiek"
+  ],
   "scripts": {
     "build": "npm run build --workspace selfiek",
     "test": "cargo test --workspace && npm test --workspace selfiek",
