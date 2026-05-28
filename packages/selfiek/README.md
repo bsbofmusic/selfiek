@@ -17,8 +17,6 @@ selfiek compile --json
 selfiek compile --use-orderk --json
 selfiek draw --json --use-templates --explain
 selfiek generate --json --dry-run --use-templates
-selfiek instant --json --prompt "K 在冲咖啡" --dry-run
-selfiek instant --json --prompt "一张图看懂手冲咖啡步骤" --no-k-reference --allow-text --tag task.infographic --dry-run
 selfiek produce --json --use-templates --dry-run
 selfiek produce --json --use-templates --quiet
 selfiek next --json --use-templates
@@ -27,6 +25,6 @@ selfiek cleanup-used --json
 
 The package bundles a Linux x64 Rust core binary. On other platforms set `SELFIEK_CORE_BIN` to a compatible `selfiek-core` binary.
 
-SelfieK reuses `cdper-gpt-image` for actual ChatGPT/CDP image generation. `produce`/`next` are the pre-generated stock lane; `instant` is the ad-hoc lane and writes to `SELFIEK_INSTANT_DIR` (`/home/agent/k-selfie-instant` by default) instead of stock.
+SelfieK reuses `cdper-gpt-image` for actual ChatGPT/CDP image generation.
 
-Prompt-library guardrails are intentionally lightweight: `library lint/report` can surface prompt-injection-like raw source text, raw-copy risk, placeholder preservation state, structured JSON key preservation hints, feedback visible-fact warnings, coverage gaps, and inventory sidecar quality. `library optimize --dry-run` returns an offline no-write plan; it does not rewrite prompts automatically. Preference Engine commands (`feedback rate`, `preference compile/report/evolve --dry-run`) learn from explicit photo feedback by compiling immutable feedback events into offline weights and reports. The package does not include an LLM prompt optimizer, UI, daemon, MCP optimize tool, or image-generation backend rewrite.
+Prompt-library guardrails are intentionally lightweight: `library lint/report` can surface prompt-injection-like raw source text, raw-copy risk, placeholder preservation state, structured JSON key preservation hints, feedback visible-fact warnings, coverage gaps, and inventory sidecar quality. `library optimize --dry-run` returns an offline no-write plan; it does not rewrite prompts automatically. Preference Engine commands (`feedback rate`, `preference compile/report/evolve --dry-run`) learn from explicit photo feedback by compiling immutable feedback events into offline weights and reports. The package does not include an LLM prompt optimizer, UI, daemon, MCP optimize tool, or image-generation backend.

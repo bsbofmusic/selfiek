@@ -17,7 +17,6 @@ jobs:
       SELFIEK_K_ORIGINAL: /tmp/selfiek-ci/K-original
       SELFIEK_NEW_DIR: /tmp/selfiek-ci/new
       SELFIEK_USED_DIR: /tmp/selfiek-ci/used
-      SELFIEK_INSTANT_DIR: /tmp/selfiek-ci/instant
       SELFIEK_PROMPT_LIB: /tmp/selfiek-ci/prompt-lib
       SELFIEK_RUNTIME_DIR: /tmp/selfiek-ci/runtime
     steps:

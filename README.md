@@ -22,7 +22,7 @@ SelfieK defaults to the existing local K pipeline paths:
 /home/agent/.local/bin/cdper-gpt-image
 ```
 
-Override paths with flags or environment variables (`SELFIEK_K_ORIGINAL`, `SELFIEK_NEW_DIR`, `SELFIEK_USED_DIR`, `SELFIEK_INSTANT_DIR`, `SELFIEK_DICE_CONFIG`, `SELFIEK_PROMPT_LIB`, `SELFIEK_CDPER_BIN`).
+Override paths with flags or environment variables (`SELFIEK_K_ORIGINAL`, `SELFIEK_NEW_DIR`, `SELFIEK_USED_DIR`, `SELFIEK_DICE_CONFIG`, `SELFIEK_PROMPT_LIB`, `SELFIEK_CDPER_BIN`).
 
 ## CLI
 
@@ -41,8 +41,6 @@ selfiek compile --json
 selfiek compile --use-orderk --json
 selfiek draw --json --use-templates --explain
 selfiek generate --json --dry-run --use-templates
-selfiek instant --json --prompt "K 在冲咖啡" --dry-run
-selfiek instant --json --prompt "一张图看懂手冲咖啡步骤" --no-k-reference --allow-text --tag task.infographic --dry-run
 selfiek produce --json --use-templates --dry-run
 selfiek produce --json --use-templates --quiet
 selfiek next --json --use-templates
@@ -53,8 +51,6 @@ selfiek cleanup-used --json
 
 - `runtime_version`: latest release
 - `contract_version`: latest release
-
-SelfieK 3.8 separates the image factory into two lanes. Stock generation (`produce`/`next`) still fills and consumes `/home/agent/k-selfie-new` and `/home/agent/k-selfie-used`. Ad-hoc generation now uses `selfiek instant`, writes to `/home/agent/k-selfie-instant` by default, marks sidecars as `mode: instant`, and refuses stock directories as instant `--out-dir` targets. `instant` reuses cdper plus prompt-card attribution, supports optional K reference images, and can switch on `--allow-text` for infographics or diagrams without contaminating the stock inventory.
 
 SelfieK 3.7 adds the Preference Engine: `feedback rate` records immutable feedback events linked to image sidecars and prompt cards; `preference compile` aggregates those events into `preference_model.json`, `preference_report.json`, and preference-aware `weights.json`; `preference report` explains positive/negative element trends; `preference evolve --dry-run` proposes candidate boosts/penalties without rewriting prompts. The hot path remains deterministic and offline: no LLM optimizer, no UI, no daemon, no MCP loop, and no cdper rewrite.
 

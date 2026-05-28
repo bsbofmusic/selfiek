@@ -13,10 +13,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
-const VERSION: &str = "3.8.0";
+const VERSION: &str = "3.8.1";
 const REF_IMAGE_PREFIX: &str = "请直接生成一张全新的写实摄影风格图片，不要回复文字，不要解释。参考拼图包含 3 张同一角色照片，仅作为面部特征和发型气质参考。请完全忽略参考图中的服装、姿势、背景、光线和拍摄角度。你需要生成一个全新的、独立的场景和构图，只保留图中人物的稳定面部特征（脸型、五官比例、肤质、发色）。";
 const NEGATIVE_SUFFIX: &str = "\n\n[Important constraints] Must avoid: deformed fingers, extra fingers, fused fingers, backwards fingers, mutated hands, poorly drawn hands, malformed limbs, extra arms, extra legs, fused legs, too many fingers, long neck, distorted face, asymmetric eyes, cross-eyed, cloned face, ugly, disfigured, blurry, low quality, pixelated, watermark, text overlay, over-processed, plastic skin, waxy appearance, uncanny valley, AI artifacts, unrealistic proportions, cartoon, anime, 3d render.";
-const NEGATIVE_SUFFIX_ALLOW_TEXT: &str = "\n\n[Important constraints] Must avoid: deformed fingers, extra fingers, fused fingers, backwards fingers, mutated hands, poorly drawn hands, malformed limbs, extra arms, extra legs, fused legs, too many fingers, long neck, distorted face, asymmetric eyes, cross-eyed, cloned face, ugly, disfigured, blurry, low quality, pixelated, watermark, over-processed, plastic skin, waxy appearance, uncanny valley, AI artifacts, unrealistic proportions, cartoon, anime, 3d render. Text is allowed only when the user explicitly asks for an infographic, diagram, poster, label, or readable steps.";
 
 #[derive(Parser, Debug)]
 #[command(name = "selfiek-core", version = VERSION, about = "Rust core for SelfieK")]
@@ -49,13 +48,6 @@ struct Cli {
         default_value = "/home/agent/k-selfie-used"
     )]
     used_dir: PathBuf,
-    #[arg(
-        long,
-        global = true,
-        env = "SELFIEK_INSTANT_DIR",
-        default_value = "/home/agent/k-selfie-instant"
-    )]
-    instant_dir: PathBuf,
     #[arg(
         long,
         global = true,
@@ -128,22 +120,6 @@ enum Commands {
         use_templates: bool,
         #[arg(long)]
         explain: bool,
-        #[arg(long)]
-        dry_run: bool,
-        #[arg(long)]
-        quiet: bool,
-        #[arg(long)]
-        out_dir: Option<PathBuf>,
-    },
-    Instant {
-        #[arg(long)]
-        prompt: String,
-        #[arg(long)]
-        no_k_reference: bool,
-        #[arg(long)]
-        allow_text: bool,
-        #[arg(long = "tag")]
-        tags: Vec<String>,
         #[arg(long)]
         dry_run: bool,
         #[arg(long)]
@@ -442,27 +418,6 @@ fn run() -> Result<()> {
             )?,
             true,
         ),
-        Commands::Instant {
-            prompt,
-            no_k_reference,
-            allow_text,
-            tags,
-            dry_run,
-            quiet,
-            out_dir,
-        } => emit(
-            instant(
-                &cli,
-                prompt,
-                !*no_k_reference,
-                *allow_text,
-                tags.clone(),
-                *dry_run,
-                *quiet,
-                out_dir.clone(),
-            )?,
-            true,
-        ),
         Commands::Produce {
             use_templates,
             quiet,
@@ -486,7 +441,6 @@ fn ensure_dirs(cli: &Cli) -> Result<()> {
     fs::create_dir_all(&cli.k_original)?;
     fs::create_dir_all(&cli.new_dir)?;
     fs::create_dir_all(&cli.used_dir)?;
-    fs::create_dir_all(&cli.instant_dir)?;
     fs::create_dir_all(&cli.runtime_dir)?;
     Ok(())
 }
@@ -497,30 +451,16 @@ fn image_files(dir: &Path) -> Vec<PathBuf> {
         .flatten()
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| p.is_file())
-        .filter(|p| is_image_path(p))
-        .collect();
-    xs.sort_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
-    xs
-}
-
-fn is_image_path(p: &Path) -> bool {
-    matches!(
-        p.extension()
-            .and_then(|s| s.to_str())
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .as_str(),
-        "png" | "jpg" | "jpeg" | "webp"
-    )
-}
-
-fn image_files_recursive(dir: &Path) -> Vec<PathBuf> {
-    let mut xs: Vec<_> = WalkDir::new(dir)
-        .min_depth(1)
-        .into_iter()
-        .filter_map(|e| e.ok().map(|e| e.path().to_path_buf()))
-        .filter(|p| p.is_file())
-        .filter(|p| is_image_path(p))
+        .filter(|p| {
+            matches!(
+                p.extension()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase()
+                    .as_str(),
+                "png" | "jpg" | "jpeg" | "webp"
+            )
+        })
         .collect();
     xs.sort_by_key(|p| fs::metadata(p).and_then(|m| m.modified()).ok());
     xs
@@ -621,7 +561,7 @@ fn status(cli: &Cli) -> Result<Value> {
     ensure_dirs(cli)?;
     let vr = validate_report(&cli.dice_config)?;
     Ok(
-        json!({"ok": true, "version": VERSION, "runtime_version": VERSION, "new": image_files(&cli.new_dir).len(), "new_limit": 100, "used": image_files(&cli.used_dir).len(), "instant": image_files_recursive(&cli.instant_dir).len(), "k_original": image_files(&cli.k_original).len(), "templates": yaml_files(&cli.prompt_lib.join("templates")).len(), "dice_config": vr, "paths": {"K-original": cli.k_original, "k-selfie-new": cli.new_dir, "k-selfie-used": cli.used_dir, "k-selfie-instant": cli.instant_dir, "prompt_lib": cli.prompt_lib, "runtime_dir": cli.runtime_dir}}),
+        json!({"ok": true, "version": VERSION, "runtime_version": VERSION, "new": image_files(&cli.new_dir).len(), "new_limit": 100, "used": image_files(&cli.used_dir).len(), "k_original": image_files(&cli.k_original).len(), "templates": yaml_files(&cli.prompt_lib.join("templates")).len(), "dice_config": vr, "paths": {"K-original": cli.k_original, "k-selfie-new": cli.new_dir, "k-selfie-used": cli.used_dir, "prompt_lib": cli.prompt_lib, "runtime_dir": cli.runtime_dir}}),
     )
 }
 fn yaml_files(dir: &Path) -> Vec<PathBuf> {
@@ -2255,8 +2195,7 @@ fn inventory_quality_value(cli: &Cli) -> Value {
         "schema":"selfiek.inventory_quality.v1",
         "k_reference_images": image_files(&cli.k_original).len(),
         "new": inventory_bucket_quality(&cli.new_dir),
-        "used": inventory_bucket_quality(&cli.used_dir),
-        "instant": inventory_bucket_quality(&cli.instant_dir)
+        "used": inventory_bucket_quality(&cli.used_dir)
     })
 }
 
@@ -2321,8 +2260,7 @@ fn coverage_value(scan: &LibraryScan, cli: &Cli) -> Value {
         "inventory_summary": {
             "k_reference_images": image_files(&cli.k_original).len(),
             "new_images": image_files(&cli.new_dir).len(),
-            "used_images": image_files(&cli.used_dir).len(),
-            "instant_images": image_files_recursive(&cli.instant_dir).len()
+            "used_images": image_files(&cli.used_dir).len()
         }
     })
 }
@@ -3041,314 +2979,6 @@ fn generate(
     )
 }
 
-fn csv_tags_many(inputs: &[String]) -> Vec<String> {
-    dedupe_strings(
-        inputs
-            .iter()
-            .flat_map(|s| s.split(','))
-            .map(|x| x.trim().to_string())
-            .filter(|x| !x.is_empty())
-            .collect(),
-    )
-}
-
-fn normalize_lexical(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            std::path::Component::CurDir => {}
-            std::path::Component::ParentDir => {
-                out.pop();
-            }
-            std::path::Component::Normal(part) => out.push(part),
-            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
-                out.push(component.as_os_str())
-            }
-        }
-    }
-    out
-}
-
-fn comparable_path(path: &Path) -> PathBuf {
-    let abs = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .unwrap_or_else(|_| PathBuf::from("."))
-            .join(path)
-    };
-    if let Ok(canon) = fs::canonicalize(&abs) {
-        return normalize_lexical(&canon);
-    }
-
-    let mut suffix: Vec<std::ffi::OsString> = Vec::new();
-    let mut probe = abs.as_path();
-    loop {
-        if probe.exists() {
-            let mut resolved = fs::canonicalize(probe).unwrap_or_else(|_| normalize_lexical(probe));
-            for part in suffix.iter().rev() {
-                resolved.push(part);
-            }
-            return normalize_lexical(&resolved);
-        }
-        if let Some(name) = probe.file_name() {
-            suffix.push(name.to_os_string());
-        }
-        match probe.parent() {
-            Some(parent) => probe = parent,
-            None => return normalize_lexical(&abs),
-        }
-    }
-}
-
-fn ensure_instant_out_dir(cli: &Cli, out_dir: &Path) -> Result<()> {
-    let out = comparable_path(out_dir);
-    let new_dir = comparable_path(&cli.new_dir);
-    let used_dir = comparable_path(&cli.used_dir);
-    if out == new_dir || out.starts_with(&new_dir) || out == used_dir || out.starts_with(&used_dir)
-    {
-        bail!(
-            "instant out-dir must not be inside stock dirs: {}",
-            out_dir.display()
-        );
-    }
-    Ok(())
-}
-
-fn instant_prompt_card(
-    request_prompt: &str,
-    k_reference: bool,
-    allow_text: bool,
-    tags: &[String],
-) -> Value {
-    let mut taxonomy_ids = vec![
-        "mode.instant".to_string(),
-        "instant.ad_hoc".to_string(),
-        if k_reference {
-            "instant.k_reference".to_string()
-        } else {
-            "instant.no_k_reference".to_string()
-        },
-        if allow_text {
-            "instant.allow_text".to_string()
-        } else {
-            "instant.no_text".to_string()
-        },
-    ];
-    taxonomy_ids.extend(tags.iter().cloned());
-    taxonomy_ids = dedupe_strings(taxonomy_ids);
-    json!({
-        "schema_version":"selfiek.prompt_card.v2",
-        "mode":"instant",
-        "template_ids":[],
-        "fragment_ids":[],
-        "source_ids":[],
-        "source_evidence":[],
-        "k_image_ids":[],
-        "taxonomy_ids":taxonomy_ids,
-        "weights_applied":[],
-        "negative_rules":[],
-        "fragments":[request_prompt],
-        "use_mode":"instant_request",
-        "priority":"ad_hoc",
-        "guardrails":{
-            "stock_pollution": false,
-            "raw_prompt_policy":"user_request_stored_as_instant_request_not_stock_template",
-            "allow_text": allow_text,
-            "k_reference": k_reference
-        },
-        "placeholders":{
-            "required":[],
-            "present":[],
-            "missing":[],
-            "status":"ok"
-        },
-        "explain":{
-            "rule_hits":[
-                {"code":"instant_separate_from_stock","status":"ok"},
-                {"code":"feedback_attribution_marker","status":"ok","taxonomy_ids":["mode.instant","instant.ad_hoc"]}
-            ],
-            "reject_reasons":[],
-            "source_copy_policy":"instant prompt is archived with sidecar and is not promoted into stock/library unless user asks"
-        }
-    })
-}
-
-fn instant_reference_images(cli: &Cli) -> Result<Vec<String>> {
-    let mut rng = rand::thread_rng();
-    let imgs = image_files(&cli.k_original);
-    if imgs.is_empty() {
-        bail!("no K reference images in {}", cli.k_original.display())
-    }
-    let n = imgs.len().min(3);
-    Ok(imgs
-        .choose_multiple(&mut rng, n)
-        .map(|p| p.to_string_lossy().to_string())
-        .collect::<Vec<_>>())
-}
-
-fn negative_suffix_for(allow_text: bool) -> &'static str {
-    if allow_text {
-        NEGATIVE_SUFFIX_ALLOW_TEXT
-    } else {
-        NEGATIVE_SUFFIX
-    }
-}
-
-#[allow(clippy::too_many_arguments)]
-fn instant(
-    cli: &Cli,
-    request_prompt: &str,
-    k_reference: bool,
-    allow_text: bool,
-    tags: Vec<String>,
-    dry_run: bool,
-    quiet: bool,
-    out_dir: Option<PathBuf>,
-) -> Result<Value> {
-    ensure_dirs(cli)?;
-    let request_prompt = request_prompt.trim();
-    if request_prompt.is_empty() {
-        bail!("instant --prompt must not be empty");
-    }
-    let out_dir = out_dir.unwrap_or_else(|| cli.instant_dir.clone());
-    ensure_instant_out_dir(cli, &out_dir)?;
-    let tags = csv_tags_many(&tags);
-    let prompt_card = instant_prompt_card(request_prompt, k_reference, allow_text, &tags);
-    let k_images = if k_reference {
-        instant_reference_images(cli)?
-    } else {
-        vec![]
-    };
-    let reference_collage = if k_reference {
-        Some(build_reference_collage(cli, &k_images)?)
-    } else {
-        None
-    };
-    let base_instruction = if k_reference {
-        REF_IMAGE_PREFIX.to_string()
-    } else if allow_text {
-        "请直接生成一张全新的图片，不要解释，不要回复聊天文字；如果用户要求信息图、图解、海报、步骤说明或标签，允许在图片内放置简洁、清晰、可读的文字。".to_string()
-    } else {
-        "请直接生成一张全新的写实图片，不要解释，不要回复文字，只输出图片内容。".to_string()
-    };
-    let full_prompt = format!(
-        "{}\n\n【即时需求】{}{}",
-        base_instruction,
-        request_prompt,
-        negative_suffix_for(allow_text)
-    );
-    if dry_run {
-        return Ok(json!({
-            "ok": true,
-            "dry_run": true,
-            "mode":"instant",
-            "source":"instant",
-            "out_dir":out_dir,
-            "stock_reserved":false,
-            "k_reference":k_reference,
-            "allow_text":allow_text,
-            "tags":tags,
-            "k_images":k_images,
-            "reference_collage":reference_collage,
-            "prompt":full_prompt,
-            "prompt_card":prompt_card
-        }));
-    }
-    fs::create_dir_all(&out_dir)?;
-    let base = format!(
-        "{}_instant_{:x}",
-        Local::now().format("%Y%m%d_%H%M%S"),
-        md5::compute(format!(
-            "{}|{}",
-            request_prompt,
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ))
-    );
-    let base = base[..base.len().min(56)].to_string();
-    let final_png = out_dir.join(format!("{base}.png"));
-    let final_json = out_dir.join(format!("{base}.json"));
-    let tmp_png = out_dir.join(format!(".{base}.tmp.png"));
-    if !quiet {
-        eprintln!("[selfiek] instant generating {}", final_png.display());
-    }
-    let gen_lock_path = cli.runtime_dir.join(".selfiek.generation.lock");
-    let gen_lock = File::create(gen_lock_path)?;
-    gen_lock.lock_exclusive()?;
-    let mut cmd = Command::new(&cli.cdper_bin);
-    cmd.arg("generate")
-        .arg("--timeout-sec")
-        .arg("300")
-        .arg("--prompt")
-        .arg(&full_prompt)
-        .arg("--out")
-        .arg(&tmp_png);
-    if let Some(collage) = &reference_collage {
-        cmd.arg("--image").arg(collage);
-    }
-    let output = cmd
-        .output()
-        .with_context(|| format!("run {}", cli.cdper_bin.display()))?;
-    if !output.status.success() {
-        let _ = fs::remove_file(&tmp_png);
-        bail!(
-            "cdper failed: status={:?}; stderr={}; stdout={}",
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-                .chars()
-                .take(2000)
-                .collect::<String>(),
-            String::from_utf8_lossy(&output.stdout)
-                .chars()
-                .take(2000)
-                .collect::<String>()
-        );
-    }
-    if !tmp_png.exists() || fs::metadata(&tmp_png)?.len() < 1024 {
-        bail!("output file missing or too small");
-    }
-    fs::rename(&tmp_png, &final_png)?;
-    let cdper = parse_last_json(&String::from_utf8_lossy(&output.stdout)).unwrap_or_else(|| {
-        json!({"raw_stdout": String::from_utf8_lossy(&output.stdout).chars().rev().take(2000).collect::<String>()})
-    });
-    let opening = format!(
-        "即时生图已完成：{}",
-        request_prompt.chars().take(48).collect::<String>()
-    );
-    let metadata = json!({
-        "ok":true,
-        "created_at":Local::now().to_rfc3339(),
-        "generator":"selfiek",
-        "selfiek_version":VERSION,
-        "mode":"instant",
-        "source":"instant",
-        "stock_reserved":false,
-        "image":final_png,
-        "opening":opening,
-        "request_prompt":request_prompt,
-        "prompt":full_prompt,
-        "prompt_card":prompt_card,
-        "k_reference":k_reference,
-        "allow_text":allow_text,
-        "tags":tags,
-        "k_images":k_images,
-        "reference_collage":reference_collage,
-        "cdper":cdper
-    });
-    write_json_atomic(&final_json, &metadata)?;
-    Ok(json!({
-        "ok":true,
-        "image":final_png,
-        "metadata":final_json,
-        "opening":metadata["opening"],
-        "source":"instant",
-        "mode":"instant",
-        "stock_reserved":false,
-        "generator":"selfiek",
-        "version":VERSION
-    }))
-}
-
 fn parse_last_json(s: &str) -> Option<Value> {
     if let Ok(v) = serde_json::from_str(s) {
         return Some(v);
@@ -3594,7 +3224,6 @@ mod tests {
             k_original: root.join("k"),
             new_dir: root.join("new"),
             used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
@@ -3652,7 +3281,6 @@ mod tests {
             k_original: root.join("k"),
             new_dir: root.join("new"),
             used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
             prompt_lib: root.join("prompt-lib"),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
@@ -3705,7 +3333,6 @@ mod tests {
             k_original: root.join("k"),
             new_dir: root.join("new"),
             used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
@@ -3766,7 +3393,6 @@ mod tests {
             k_original: root.join("k"),
             new_dir: root.join("new"),
             used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
@@ -3809,7 +3435,6 @@ mod tests {
             k_original: root.join("k"),
             new_dir: root.join("new"),
             used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
@@ -3840,7 +3465,6 @@ mod tests {
             k_original: root.join("k"),
             new_dir: root.join("new"),
             used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
@@ -3903,7 +3527,6 @@ mod tests {
             k_original: root.join("k"),
             new_dir: root.join("new"),
             used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
@@ -3949,7 +3572,6 @@ mod tests {
             k_original: root.join("k"),
             new_dir: root.join("new"),
             used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
@@ -3994,7 +3616,6 @@ mod tests {
             k_original: root.join("k"),
             new_dir: root.join("new"),
             used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
@@ -4044,7 +3665,6 @@ mod tests {
             k_original: root.join("k"),
             new_dir: root.join("new"),
             used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
@@ -4083,7 +3703,6 @@ mod tests {
             k_original: root.join("k"),
             new_dir: root.join("new"),
             used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
@@ -4131,166 +3750,6 @@ mod tests {
     }
 
     #[test]
-    fn instant_dry_run_no_reference_allows_text_without_touching_stock() {
-        let root = temp_path("instant-dry-run");
-        let cli = Cli {
-            dice_config: root.join("dice.json"),
-            k_original: root.join("k"),
-            new_dir: root.join("new"),
-            used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
-            prompt_lib: root.clone(),
-            runtime_dir: root.join("runtime"),
-            cdper_bin: PathBuf::from("cdper-gpt-image"),
-            json: true,
-            command: Commands::Status,
-        };
-        let out = instant(
-            &cli,
-            "一张图看懂手冲咖啡步骤",
-            false,
-            true,
-            vec!["task.infographic,topic.coffee".into()],
-            true,
-            true,
-            None,
-        )
-        .unwrap();
-        assert_eq!(out["ok"].as_bool(), Some(true));
-        assert_eq!(out["mode"].as_str(), Some("instant"));
-        assert_eq!(out["source"].as_str(), Some("instant"));
-        assert_eq!(out["stock_reserved"].as_bool(), Some(false));
-        assert_eq!(
-            out["out_dir"].as_str(),
-            Some(root.join("instant").to_str().unwrap())
-        );
-        assert_eq!(image_files(&root.join("new")).len(), 0);
-        assert_eq!(image_files(&root.join("used")).len(), 0);
-        let prompt = out["prompt"].as_str().unwrap();
-        assert!(prompt.contains("允许在图片内放置简洁、清晰、可读的文字"));
-        assert!(!prompt.contains("text overlay"));
-        let taxonomy = string_list_at(&out["prompt_card"], &["taxonomy_ids"]);
-        assert!(taxonomy.contains(&"mode.instant".to_string()));
-        assert!(taxonomy.contains(&"instant.ad_hoc".to_string()));
-        assert!(taxonomy.contains(&"instant.no_k_reference".to_string()));
-        assert!(taxonomy.contains(&"instant.allow_text".to_string()));
-        assert!(taxonomy.contains(&"task.infographic".to_string()));
-        assert!(taxonomy.contains(&"topic.coffee".to_string()));
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn instant_refuses_stock_out_dir_override() {
-        let root = temp_path("instant-stock-guard");
-        let cli = Cli {
-            dice_config: root.join("dice.json"),
-            k_original: root.join("k"),
-            new_dir: root.join("new"),
-            used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
-            prompt_lib: root.clone(),
-            runtime_dir: root.join("runtime"),
-            cdper_bin: PathBuf::from("cdper-gpt-image"),
-            json: true,
-            command: Commands::Status,
-        };
-        let err = instant(
-            &cli,
-            "K 在冲咖啡",
-            false,
-            false,
-            vec![],
-            true,
-            true,
-            Some(root.join("new")),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("instant out-dir must not be inside stock dirs"));
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn instant_refuses_stock_out_dir_with_parent_traversal() {
-        let root = temp_path("instant-traversal-guard");
-        let nested = root.join("nested");
-        fs::create_dir_all(&nested).unwrap();
-        let cli = Cli {
-            dice_config: root.join("dice.json"),
-            k_original: root.join("k"),
-            new_dir: root.join("new"),
-            used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
-            prompt_lib: root.clone(),
-            runtime_dir: root.join("runtime"),
-            cdper_bin: PathBuf::from("cdper-gpt-image"),
-            json: true,
-            command: Commands::Status,
-        };
-        let traversal = nested.join("..").join("new").join("subdir");
-        let err = instant(
-            &cli,
-            "K 在冲咖啡",
-            false,
-            false,
-            vec![],
-            true,
-            true,
-            Some(traversal),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("instant out-dir must not be inside stock dirs"));
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn instant_refuses_stock_out_dir_symlink() {
-        let root = temp_path("instant-symlink-guard");
-        fs::create_dir_all(root.join("new")).unwrap();
-        std::os::unix::fs::symlink(root.join("new"), root.join("link_to_new")).unwrap();
-        let cli = Cli {
-            dice_config: root.join("dice.json"),
-            k_original: root.join("k"),
-            new_dir: root.join("new"),
-            used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
-            prompt_lib: root.clone(),
-            runtime_dir: root.join("runtime"),
-            cdper_bin: PathBuf::from("cdper-gpt-image"),
-            json: true,
-            command: Commands::Status,
-        };
-        let err = instant(
-            &cli,
-            "K 在冲咖啡",
-            false,
-            false,
-            vec![],
-            true,
-            true,
-            Some(root.join("link_to_new").join("subdir")),
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("instant out-dir must not be inside stock dirs"));
-        fs::remove_dir_all(root).ok();
-    }
-
-    #[test]
-    fn instant_prompt_card_has_feedback_attribution_without_tags() {
-        let card = instant_prompt_card("K 在冲咖啡", true, false, &[]);
-        let taxonomy = string_list_at(&card, &["taxonomy_ids"]);
-        assert!(taxonomy.contains(&"mode.instant".to_string()));
-        assert!(taxonomy.contains(&"instant.ad_hoc".to_string()));
-        assert!(taxonomy.contains(&"instant.k_reference".to_string()));
-        assert!(taxonomy.contains(&"instant.no_text".to_string()));
-        assert!(card["template_ids"].as_array().unwrap().is_empty());
-        assert_eq!(card["guardrails"]["stock_pollution"].as_bool(), Some(false));
-    }
-
-    #[test]
     fn preference_compile_aggregates_feedback_into_runtime_model_and_weights() {
         let root = temp_path("preference-compile");
         write_fixture_library(&root);
@@ -4330,7 +3789,6 @@ mod tests {
             k_original: root.join("k"),
             new_dir: root.join("new"),
             used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
@@ -4379,7 +3837,6 @@ mod tests {
             k_original: root.join("k"),
             new_dir: root.join("new"),
             used_dir: root.join("used"),
-            instant_dir: root.join("instant"),
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
