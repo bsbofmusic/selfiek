@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
-const VERSION: &str = "3.6.2";
+const VERSION: &str = "3.7.0";
 const REF_IMAGE_PREFIX: &str = "请直接生成一张全新的写实摄影风格图片，不要回复文字，不要解释。参考拼图包含 3 张同一角色照片，仅作为面部特征和发型气质参考。请完全忽略参考图中的服装、姿势、背景、光线和拍摄角度。你需要生成一个全新的、独立的场景和构图，只保留图中人物的稳定面部特征（脸型、五官比例、肤质、发色）。";
 const NEGATIVE_SUFFIX: &str = "\n\n[Important constraints] Must avoid: deformed fingers, extra fingers, fused fingers, backwards fingers, mutated hands, poorly drawn hands, malformed limbs, extra arms, extra legs, fused legs, too many fingers, long neck, distorted face, asymmetric eyes, cross-eyed, cloned face, ugly, disfigured, blurry, low quality, pixelated, watermark, text overlay, over-processed, plastic skin, waxy appearance, uncanny valley, AI artifacts, unrealistic proportions, cartoon, anime, 3d render.";
 
@@ -89,6 +89,14 @@ enum Commands {
         #[command(subcommand)]
         command: LibraryCommands,
     },
+    Feedback {
+        #[command(subcommand)]
+        command: FeedbackCommands,
+    },
+    Preference {
+        #[command(subcommand)]
+        command: PreferenceCommands,
+    },
     Draw {
         #[arg(long)]
         scene: Option<u32>,
@@ -153,6 +161,36 @@ enum LibraryCommands {
         dry_run: bool,
         #[arg(long)]
         apply: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum FeedbackCommands {
+    Rate {
+        #[arg(long)]
+        image: PathBuf,
+        #[arg(long)]
+        score: i32,
+        #[arg(long)]
+        reason: Option<String>,
+        #[arg(long = "like")]
+        like_tags: Option<String>,
+        #[arg(long = "dislike")]
+        dislike_tags: Option<String>,
+        #[arg(long)]
+        visual_note: Option<String>,
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum PreferenceCommands {
+    Compile,
+    Report,
+    Evolve {
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -346,6 +384,8 @@ fn run() -> Result<()> {
             emit(compile_templates(&cli, out.clone(), *use_orderk)?, true)
         }
         Commands::Library { command } => emit(library_command(&cli, command)?, true),
+        Commands::Feedback { command } => emit(feedback_command(&cli, command)?, true),
+        Commands::Preference { command } => emit(preference_command(&cli, command)?, true),
         Commands::Draw {
             scene,
             style,
@@ -1527,6 +1567,482 @@ fn template_weight_entries(t: &TemplateEntry) -> Vec<Value> {
     out
 }
 
+fn csv_tags(input: &Option<String>) -> Vec<String> {
+    input
+        .as_deref()
+        .unwrap_or("")
+        .split(',')
+        .map(|x| x.trim().to_string())
+        .filter(|x| !x.is_empty())
+        .collect()
+}
+
+fn string_list_at(v: &Value, keys: &[&str]) -> Vec<String> {
+    get_path_value(v, keys)
+        .map(value_to_string_list)
+        .unwrap_or_default()
+}
+
+fn feedback_sentiment(score: i32) -> &'static str {
+    if score > 0 {
+        "positive"
+    } else if score < 0 {
+        "negative"
+    } else {
+        "neutral"
+    }
+}
+
+fn prompt_card_from_sidecar(sidecar: &Value) -> Value {
+    sidecar
+        .get("prompt_card")
+        .cloned()
+        .or_else(|| get_path_value(sidecar, &["metadata", "prompt_card"]).cloned())
+        .unwrap_or(Value::Null)
+}
+
+#[derive(Debug, Clone)]
+struct FeedbackRateInput {
+    image: PathBuf,
+    score: i32,
+    reason: Option<String>,
+    like_tags: Option<String>,
+    dislike_tags: Option<String>,
+    visual_note: Option<String>,
+    dry_run: bool,
+}
+
+fn feedback_rate(cli: &Cli, input: FeedbackRateInput) -> Result<Value> {
+    let FeedbackRateInput {
+        image,
+        score,
+        reason,
+        like_tags,
+        dislike_tags,
+        visual_note,
+        dry_run,
+    } = input;
+    let image = image.as_path();
+    if !(-2..=2).contains(&score) {
+        bail!("score must be between -2 and +2");
+    }
+    if !image.exists() {
+        bail!("image not found: {}", image.display());
+    }
+    let sidecar_path = image.with_extension("json");
+    if !sidecar_path.exists() {
+        bail!(
+            "sidecar metadata not found for {}; refusing unattributed feedback",
+            image.display()
+        );
+    }
+    let sidecar: Value = read_json_file(&sidecar_path)?;
+    let prompt_card = prompt_card_from_sidecar(&sidecar);
+    if prompt_card.is_null() {
+        bail!(
+            "prompt_card missing in {}; refusing unattributed feedback",
+            sidecar_path.display()
+        );
+    }
+    let template_ids = string_list_at(&prompt_card, &["template_ids"]);
+    let taxonomy_ids = string_list_at(&prompt_card, &["taxonomy_ids"]);
+    if template_ids.is_empty() && taxonomy_ids.is_empty() {
+        bail!(
+            "prompt_card has no template_ids or taxonomy_ids in {}; refusing unattributed feedback",
+            sidecar_path.display()
+        );
+    }
+    let liked_elements = dedupe_strings(csv_tags(&like_tags));
+    let disliked_elements = dedupe_strings(csv_tags(&dislike_tags));
+    let created_at = Utc::now();
+    let stem = image
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("image");
+    let id = format!(
+        "fb-{}-{}-{}",
+        created_at.format("%Y%m%dT%H%M%SZ"),
+        sanitize_slug(stem),
+        created_at.timestamp_nanos_opt().unwrap_or_default().abs()
+    );
+    let event = json!({
+        "schema":"selfiek.feedback_event.v1",
+        "id":id,
+        "created_at":created_at.to_rfc3339(),
+        "image":image,
+        "sidecar":sidecar_path,
+        "score":score,
+        "sentiment":feedback_sentiment(score),
+        "reason":reason.unwrap_or_default(),
+        "visual_note":visual_note.unwrap_or_default(),
+        "liked_elements":liked_elements,
+        "disliked_elements":disliked_elements,
+        "attribution":{
+            "template_ids":template_ids,
+            "taxonomy_ids":taxonomy_ids
+        },
+        "prompt_card":prompt_card,
+        "policy":"feedback_event_only_no_prompt_rewrite"
+    });
+    let events_dir = cli.prompt_lib.join("feedback/events");
+    let event_path = events_dir.join(format!("{}.json", id));
+    if !dry_run {
+        fs::create_dir_all(&events_dir)?;
+        let mut f = File::options()
+            .write(true)
+            .create_new(true)
+            .open(&event_path)
+            .with_context(|| format!("create feedback event {}", event_path.display()))?;
+        f.write_all(serde_json::to_string_pretty(&event)?.as_bytes())?;
+        f.write_all(b"\n")?;
+        f.sync_all().ok();
+    }
+    Ok(json!({
+        "ok":true,
+        "schema":"selfiek.feedback_rate.v1",
+        "dry_run":dry_run,
+        "event_path":event_path,
+        "event":event
+    }))
+}
+
+fn feedback_command(cli: &Cli, command: &FeedbackCommands) -> Result<Value> {
+    match command {
+        FeedbackCommands::Rate {
+            image,
+            score,
+            reason,
+            like_tags,
+            dislike_tags,
+            visual_note,
+            dry_run,
+        } => feedback_rate(
+            cli,
+            FeedbackRateInput {
+                image: image.clone(),
+                score: *score,
+                reason: reason.clone(),
+                like_tags: like_tags.clone(),
+                dislike_tags: dislike_tags.clone(),
+                visual_note: visual_note.clone(),
+                dry_run: *dry_run,
+            },
+        ),
+    }
+}
+
+fn feedback_event_files(cli: &Cli) -> Vec<PathBuf> {
+    let dir = cli.prompt_lib.join("feedback/events");
+    if !dir.exists() {
+        return vec![];
+    }
+    let mut xs: Vec<_> = WalkDir::new(dir)
+        .max_depth(1)
+        .into_iter()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path().to_path_buf())
+        .filter(|p| p.is_file())
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("json"))
+        .collect();
+    xs.sort();
+    xs
+}
+
+fn read_feedback_events(cli: &Cli) -> Vec<Value> {
+    feedback_event_files(cli)
+        .into_iter()
+        .filter_map(|p| read_json_file::<Value>(&p).ok())
+        .filter(|v| v.get("schema").and_then(|x| x.as_str()) == Some("selfiek.feedback_event.v1"))
+        .collect()
+}
+
+fn add_pref_score(
+    scores: &mut BTreeMap<String, i32>,
+    counts: &mut BTreeMap<String, usize>,
+    atom: &str,
+    delta: i32,
+) {
+    let atom = atom.trim();
+    if atom.is_empty() || delta == 0 {
+        return;
+    }
+    *scores.entry(atom.to_string()).or_insert(0) += delta;
+    *counts.entry(atom.to_string()).or_insert(0) += 1;
+}
+
+fn event_taxonomy_atoms(event: &Value) -> Vec<String> {
+    let mut atoms = string_list_at(event, &["attribution", "taxonomy_ids"]);
+    atoms.extend(
+        string_list_at(event, &["attribution", "template_ids"])
+            .into_iter()
+            .map(|id| format!("template.{}", id)),
+    );
+    dedupe_strings(atoms)
+}
+
+fn preference_weight_rows(
+    scores: &BTreeMap<String, i32>,
+    counts: &BTreeMap<String, usize>,
+) -> Vec<Value> {
+    let mut rows: Vec<Value> = scores
+        .iter()
+        .map(|(atom, raw)| {
+            let bounded = (*raw).clamp(-12, 12);
+            let sample_count = counts.get(atom).copied().unwrap_or(0);
+            let confidence = if sample_count >= 5 {
+                "high"
+            } else if sample_count >= 2 {
+                "medium"
+            } else {
+                "low"
+            };
+            json!({
+                "atom":atom,
+                "raw_score":raw,
+                "score_delta":bounded,
+                "sample_count":sample_count,
+                "confidence":confidence
+            })
+        })
+        .collect();
+    rows.sort_by(|a, b| {
+        let ascore = a
+            .get("score_delta")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0)
+            .abs();
+        let bscore = b
+            .get("score_delta")
+            .and_then(|x| x.as_i64())
+            .unwrap_or(0)
+            .abs();
+        bscore.cmp(&ascore).then_with(|| {
+            a.get("atom")
+                .and_then(|x| x.as_str())
+                .unwrap_or("")
+                .cmp(b.get("atom").and_then(|x| x.as_str()).unwrap_or(""))
+        })
+    });
+    rows
+}
+
+fn top_pref_rows(rows: &[Value], positive: bool) -> Vec<Value> {
+    rows.iter()
+        .filter(|v| {
+            let delta = v.get("score_delta").and_then(|x| x.as_i64()).unwrap_or(0);
+            if positive {
+                delta > 0
+            } else {
+                delta < 0
+            }
+        })
+        .take(12)
+        .cloned()
+        .collect()
+}
+
+fn build_preference_outputs(cli: &Cli) -> Result<(Value, Value)> {
+    let events = read_feedback_events(cli);
+    let generated_at = Utc::now().to_rfc3339();
+    let mut atom_scores: BTreeMap<String, i32> = BTreeMap::new();
+    let mut atom_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut combo_scores: BTreeMap<String, i32> = BTreeMap::new();
+    let mut combo_counts: BTreeMap<String, usize> = BTreeMap::new();
+    let mut positive_events = 0usize;
+    let mut negative_events = 0usize;
+
+    for event in &events {
+        let score = event.get("score").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+        if score > 0 {
+            positive_events += 1;
+        } else if score < 0 {
+            negative_events += 1;
+        }
+        for atom in event_taxonomy_atoms(event) {
+            add_pref_score(&mut atom_scores, &mut atom_counts, &atom, score);
+        }
+        let directed = score.abs().max(1);
+        for atom in string_list_at(event, &["liked_elements"]) {
+            add_pref_score(&mut atom_scores, &mut atom_counts, &atom, directed);
+        }
+        for atom in string_list_at(event, &["disliked_elements"]) {
+            add_pref_score(&mut atom_scores, &mut atom_counts, &atom, -directed);
+        }
+        let mut combo_atoms = string_list_at(event, &["attribution", "taxonomy_ids"]);
+        combo_atoms.sort();
+        combo_atoms = dedupe_strings(combo_atoms);
+        for i in 0..combo_atoms.len() {
+            for j in (i + 1)..combo_atoms.len() {
+                let combo = format!("{}|{}", combo_atoms[i], combo_atoms[j]);
+                add_pref_score(&mut combo_scores, &mut combo_counts, &combo, score);
+            }
+        }
+    }
+
+    let atom_weights = preference_weight_rows(&atom_scores, &atom_counts);
+    let combo_weights = preference_weight_rows(&combo_scores, &combo_counts);
+    let model = json!({
+        "schema":"selfiek.preference_model.v1",
+        "version":VERSION,
+        "generated_at":generated_at,
+        "event_count":events.len(),
+        "positive_events":positive_events,
+        "negative_events":negative_events,
+        "neutral_events":events.len().saturating_sub(positive_events + negative_events),
+        "exploration_rate":0.20,
+        "atom_weights":atom_weights,
+        "combo_weights":combo_weights,
+        "policy":"deterministic_offline_preference_weights_no_llm_hot_path"
+    });
+    let report = json!({
+        "ok":true,
+        "schema":"selfiek.preference_report.v1",
+        "version":VERSION,
+        "generated_at":model["generated_at"].clone(),
+        "event_count":events.len(),
+        "positive_events":positive_events,
+        "negative_events":negative_events,
+        "top_positive_elements":top_pref_rows(model["atom_weights"].as_array().unwrap_or(&vec![]), true),
+        "top_negative_elements":top_pref_rows(model["atom_weights"].as_array().unwrap_or(&vec![]), false),
+        "top_positive_combos":top_pref_rows(model["combo_weights"].as_array().unwrap_or(&vec![]), true),
+        "top_negative_combos":top_pref_rows(model["combo_weights"].as_array().unwrap_or(&vec![]), false),
+        "policy":"report_only_no_prompt_rewrite"
+    });
+    Ok((model, report))
+}
+
+fn preference_compile(cli: &Cli) -> Result<Value> {
+    ensure_dirs(cli)?;
+    let (model, report) = build_preference_outputs(cli)?;
+    let model_path = cli.runtime_dir.join("preference_model.json");
+    let report_path = cli.runtime_dir.join("preference_report.json");
+    write_json_atomic(&model_path, &model)?;
+    write_json_atomic(&report_path, &report)?;
+    let scan = library_scan(cli)?;
+    let weights = build_weights_value(&scan, &Utc::now().to_rfc3339(), Some(&model));
+    let weights_path = cli.runtime_dir.join("weights.json");
+    write_json_atomic(&weights_path, &weights)?;
+    Ok(json!({
+        "ok":scan.errors.is_empty(),
+        "schema":"selfiek.preference_compile.v1",
+        "version":VERSION,
+        "artifacts":{
+            "preference_model":model_path,
+            "preference_report":report_path,
+            "weights":weights_path
+        },
+        "event_count":model["event_count"],
+        "errors":scan.errors,
+        "warnings":scan.warnings,
+        "policy":"offline_compile_only_no_llm_no_prompt_rewrite"
+    }))
+}
+
+fn preference_report(cli: &Cli) -> Result<Value> {
+    let (_, report) = build_preference_outputs(cli)?;
+    Ok(report)
+}
+
+fn preference_evolve(cli: &Cli, dry_run: bool) -> Result<Value> {
+    if !dry_run {
+        bail!("preference evolve currently supports --dry-run only; automatic prompt rewrites are not allowed");
+    }
+    let (model, report) = build_preference_outputs(cli)?;
+    let mut proposed_changes = Vec::new();
+    for row in model["atom_weights"].as_array().unwrap_or(&vec![]) {
+        let delta = row.get("score_delta").and_then(|x| x.as_i64()).unwrap_or(0);
+        let samples = row
+            .get("sample_count")
+            .and_then(|x| x.as_u64())
+            .unwrap_or(0);
+        if samples >= 2 && delta.abs() >= 3 {
+            proposed_changes.push(json!({
+                "target":row.get("atom").cloned().unwrap_or(Value::Null),
+                "delta":delta,
+                "sample_count":samples,
+                "action": if delta > 0 { "boost" } else { "penalize" },
+                "reason":"repeated explicit feedback reached confidence threshold"
+            }));
+        }
+    }
+    Ok(json!({
+        "ok":true,
+        "schema":"selfiek.preference_evolve_plan.v1",
+        "version":VERSION,
+        "dry_run":true,
+        "apply_supported":false,
+        "proposed_changes":proposed_changes,
+        "preference_report":report,
+        "policy":"candidate_plan_only_manual_review_for_hard_blocks"
+    }))
+}
+
+fn preference_command(cli: &Cli, command: &PreferenceCommands) -> Result<Value> {
+    match command {
+        PreferenceCommands::Compile => preference_compile(cli),
+        PreferenceCommands::Report => preference_report(cli),
+        PreferenceCommands::Evolve { dry_run } => preference_evolve(cli, *dry_run),
+    }
+}
+
+fn load_preference_model(cli: &Cli) -> Option<Value> {
+    read_json_file(&cli.runtime_dir.join("preference_model.json")).ok()
+}
+
+fn preference_atom_delta(model: &Value, atom: &str) -> i32 {
+    model
+        .get("atom_weights")
+        .and_then(|x| x.as_array())
+        .into_iter()
+        .flatten()
+        .find(|row| row.get("atom").and_then(|x| x.as_str()) == Some(atom))
+        .and_then(|row| row.get("score_delta").and_then(|x| x.as_i64()))
+        .unwrap_or(0) as i32
+}
+
+fn preference_score_for_template(t: &TemplateEntry, model: Option<&Value>) -> i32 {
+    let Some(model) = model else {
+        return 0;
+    };
+    let mut score = preference_atom_delta(model, &format!("template.{}", t.id));
+    for atom in &t.taxonomy_ids {
+        score += preference_atom_delta(model, atom);
+    }
+    if let Some(combos) = model.get("combo_weights").and_then(|x| x.as_array()) {
+        for row in combos {
+            let Some(combo) = row.get("atom").and_then(|x| x.as_str()) else {
+                continue;
+            };
+            let applies = combo
+                .split('|')
+                .all(|part| t.taxonomy_ids.iter().any(|x| x == part));
+            if applies {
+                score += row.get("score_delta").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            }
+        }
+    }
+    score
+}
+
+fn preference_weight_entries_for_template(t: &TemplateEntry, model: Option<&Value>) -> Vec<Value> {
+    let Some(model) = model else {
+        return vec![];
+    };
+    let mut out = Vec::new();
+    let template_atom = format!("template.{}", t.id);
+    for atom in std::iter::once(&template_atom).chain(t.taxonomy_ids.iter()) {
+        let delta = preference_atom_delta(model, atom);
+        if delta != 0 {
+            out.push(json!({
+                "kind":"preference_atom",
+                "atom":atom,
+                "score_delta":delta
+            }));
+        }
+    }
+    out
+}
+
 fn build_prompt_card_for_template(t: &TemplateEntry) -> Value {
     let fragments: Vec<String> = t
         .fragment_texts
@@ -1749,7 +2265,11 @@ fn coverage_value(scan: &LibraryScan, cli: &Cli) -> Value {
     })
 }
 
-fn build_weights_value(scan: &LibraryScan, generated_at: &str) -> Value {
+fn build_weights_value(
+    scan: &LibraryScan,
+    generated_at: &str,
+    preference_model: Option<&Value>,
+) -> Value {
     let mut template_weights = Vec::new();
     let mut tag_scores: BTreeMap<String, i32> = BTreeMap::new();
     for t in &scan.templates {
@@ -1771,6 +2291,15 @@ fn build_weights_value(scan: &LibraryScan, generated_at: &str) -> Value {
         .filter(|(_, v)| **v < 0)
         .map(|(k, v)| (k.clone(), *v))
         .collect();
+    let preference_atom_weights = preference_model
+        .and_then(|m| m.get("atom_weights"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let preference_combo_weights = preference_model
+        .and_then(|m| m.get("combo_weights"))
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+    let preference_model_value = preference_model.cloned().unwrap_or(Value::Null);
     json!({
         "schema":"selfiek.weights.v2",
         "version":VERSION,
@@ -1778,6 +2307,9 @@ fn build_weights_value(scan: &LibraryScan, generated_at: &str) -> Value {
         "template_weights":template_weights,
         "tag_boosts":tag_boosts,
         "tag_penalties":tag_penalties,
+        "preference_model":preference_model_value,
+        "preference_atom_weights":preference_atom_weights,
+        "preference_combo_weights":preference_combo_weights,
         "runtime_policy":"deterministic_offline_weights_only_no_llm_hot_path"
     })
 }
@@ -1845,7 +2377,8 @@ fn compile_templates(cli: &Cli, out: Option<PathBuf>, use_orderk: bool) -> Resul
         .filter(|t| !t.fragment_texts.is_empty())
         .map(build_prompt_card_for_template)
         .collect();
-    let weights = build_weights_value(&scan, &generated_at);
+    let preference_model = load_preference_model(cli);
+    let weights = build_weights_value(&scan, &generated_at, preference_model.as_ref());
     let template_out = out.unwrap_or_else(|| cli.runtime_dir.join("template_index.json"));
     let fragment_out = cli.runtime_dir.join("fragment_index.json");
     let cards_out = cli.runtime_dir.join("prompt_cards.jsonl");
@@ -2126,15 +2659,33 @@ fn template_score(t: &TemplateEntry, scene: &Scene, style: &Style, outfit: &Outf
 
 fn choose_template_card(cli: &Cli, scene: &Scene, style: &Style, outfit: &Outfit) -> Option<Value> {
     let index = load_template_index(cli)?;
+    let preference_model = load_preference_model(cli);
     let mut scored: Vec<_> = index
         .templates
         .iter()
-        .map(|t| (template_score(t, scene, style, outfit), t))
+        .map(|t| {
+            (
+                template_score(t, scene, style, outfit)
+                    + preference_score_for_template(t, preference_model.as_ref()),
+                t,
+            )
+        })
         .filter(|(s, _)| *s > 0)
         .collect();
     scored.sort_by_key(|item| std::cmp::Reverse(item.0));
     let (score, best) = scored.first()?;
+    let pref_score = preference_score_for_template(best, preference_model.as_ref());
     let mut card = build_prompt_card_for_template(best);
+    let preference_entries =
+        preference_weight_entries_for_template(best, preference_model.as_ref());
+    if !preference_entries.is_empty() {
+        if let Some(weights) = card
+            .get_mut("weights_applied")
+            .and_then(|x| x.as_array_mut())
+        {
+            weights.extend(preference_entries);
+        }
+    }
     card["score"] = json!(score);
     if let Some(rule_hits) = card
         .get_mut("explain")
@@ -2146,6 +2697,13 @@ fn choose_template_card(cli: &Cli, scene: &Scene, style: &Style, outfit: &Outfit
             "status":"ok",
             "score":score
         }));
+        if pref_score != 0 {
+            rule_hits.push(json!({
+                "code":"preference_model_applied",
+                "status":"ok",
+                "score_delta":pref_score
+            }));
+        }
     }
     Some(card)
 }
@@ -3031,6 +3589,303 @@ mod tests {
             .iter()
             .any(|v| v.get("code").and_then(|x| x.as_str()) == Some("expand_taxonomy_coverage")));
         assert!(!root.join("runtime/optimization_plan.json").exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn feedback_rate_writes_event_with_prompt_card_attribution() {
+        let root = temp_path("feedback-event");
+        write_fixture_library(&root);
+        fs::create_dir_all(root.join("used")).unwrap();
+        let image = root.join("used/sample.png");
+        fs::write(&image, b"not-real-image").unwrap();
+        fs::write(
+            root.join("used/sample.json"),
+            r#"{
+              "opening":"hi",
+              "prompt_card":{
+                "schema_version":"selfiek.prompt_card.v2",
+                "template_ids":["tpl-demo"],
+                "taxonomy_ids":["scene.concert","style.candid_snapshot","outfit.casual"]
+              }
+            }"#,
+        )
+        .unwrap();
+        let cli = Cli {
+            dice_config: root.join("dice.json"),
+            k_original: root.join("k"),
+            new_dir: root.join("new"),
+            used_dir: root.join("used"),
+            prompt_lib: root.clone(),
+            runtime_dir: root.join("runtime"),
+            cdper_bin: PathBuf::from("cdper-gpt-image"),
+            json: true,
+            command: Commands::Status,
+        };
+        let out = feedback_rate(
+            &cli,
+            FeedbackRateInput {
+                image: image.clone(),
+                score: 2,
+                reason: Some("这张很自然，舞台光和衣服都好".into()),
+                like_tags: Some("lighting.stage_light,outfit.casual".into()),
+                dislike_tags: Some("face_likeness".into()),
+                visual_note: Some("真实画面有舞台光、休闲服和人群背景".into()),
+                dry_run: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(out["ok"].as_bool(), Some(true));
+        let event_path = PathBuf::from(out["event_path"].as_str().unwrap());
+        assert!(event_path.exists());
+        let event: Value = read_json_file(&event_path).unwrap();
+        assert_eq!(event["schema"].as_str(), Some("selfiek.feedback_event.v1"));
+        assert_eq!(event["score"].as_i64(), Some(2));
+        assert_eq!(
+            event["attribution"]["template_ids"].as_array().unwrap()[0].as_str(),
+            Some("tpl-demo")
+        );
+        assert!(event["liked_elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some("outfit.casual")));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn feedback_rate_refuses_missing_sidecar() {
+        let root = temp_path("feedback-refuse-missing-sidecar");
+        write_fixture_library(&root);
+        fs::create_dir_all(root.join("used")).unwrap();
+        let image = root.join("used/sample.png");
+        fs::write(&image, b"not-real-image").unwrap();
+        let cli = Cli {
+            dice_config: root.join("dice.json"),
+            k_original: root.join("k"),
+            new_dir: root.join("new"),
+            used_dir: root.join("used"),
+            prompt_lib: root.clone(),
+            runtime_dir: root.join("runtime"),
+            cdper_bin: PathBuf::from("cdper-gpt-image"),
+            json: true,
+            command: Commands::Status,
+        };
+        let err = feedback_rate(
+            &cli,
+            FeedbackRateInput {
+                image,
+                score: 1,
+                reason: Some("不错".into()),
+                like_tags: None,
+                dislike_tags: None,
+                visual_note: None,
+                dry_run: false,
+            },
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("sidecar metadata not found"));
+        assert!(err.contains("refusing unattributed feedback"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn feedback_rate_refuses_missing_or_empty_prompt_card() {
+        let root = temp_path("feedback-refuse-unattributed");
+        write_fixture_library(&root);
+        fs::create_dir_all(root.join("used")).unwrap();
+        let image = root.join("used/sample.png");
+        fs::write(&image, b"not-real-image").unwrap();
+        fs::write(root.join("used/sample.json"), "{\"opening\":\"hi\"}").unwrap();
+        let cli = Cli {
+            dice_config: root.join("dice.json"),
+            k_original: root.join("k"),
+            new_dir: root.join("new"),
+            used_dir: root.join("used"),
+            prompt_lib: root.clone(),
+            runtime_dir: root.join("runtime"),
+            cdper_bin: PathBuf::from("cdper-gpt-image"),
+            json: true,
+            command: Commands::Status,
+        };
+        let missing = feedback_rate(
+            &cli,
+            FeedbackRateInput {
+                image: image.clone(),
+                score: 1,
+                reason: Some("不错".into()),
+                like_tags: None,
+                dislike_tags: None,
+                visual_note: None,
+                dry_run: false,
+            },
+        );
+        assert!(missing
+            .unwrap_err()
+            .to_string()
+            .contains("prompt_card missing"));
+        fs::write(
+            root.join("used/sample.json"),
+            "{\"opening\":\"hi\",\"prompt_card\":{\"schema_version\":\"selfiek.prompt_card.v2\"}}",
+        )
+        .unwrap();
+        let empty = feedback_rate(
+            &cli,
+            FeedbackRateInput {
+                image: image.clone(),
+                score: 1,
+                reason: Some("不错".into()),
+                like_tags: None,
+                dislike_tags: None,
+                visual_note: None,
+                dry_run: false,
+            },
+        );
+        assert!(empty
+            .unwrap_err()
+            .to_string()
+            .contains("no template_ids or taxonomy_ids"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn preference_compile_aggregates_feedback_into_runtime_model_and_weights() {
+        let root = temp_path("preference-compile");
+        write_fixture_library(&root);
+        fs::create_dir_all(root.join("feedback/events")).unwrap();
+        fs::write(
+            root.join("feedback/events/positive.json"),
+            r#"{
+              "schema":"selfiek.feedback_event.v1",
+              "id":"positive",
+              "score":2,
+              "liked_elements":["lighting.stage_light"],
+              "disliked_elements":[],
+              "attribution":{
+                "template_ids":["tpl-demo"],
+                "taxonomy_ids":["scene.concert","style.candid_snapshot","outfit.casual"]
+              }
+            }"#,
+        )
+        .unwrap();
+        fs::write(
+            root.join("feedback/events/negative.json"),
+            r#"{
+              "schema":"selfiek.feedback_event.v1",
+              "id":"negative",
+              "score":-2,
+              "liked_elements":[],
+              "disliked_elements":["face_likeness"],
+              "attribution":{
+                "template_ids":["tpl-stagey"],
+                "taxonomy_ids":["style.stagey","outfit.plastic"]
+              }
+            }"#,
+        )
+        .unwrap();
+        let cli = Cli {
+            dice_config: root.join("dice.json"),
+            k_original: root.join("k"),
+            new_dir: root.join("new"),
+            used_dir: root.join("used"),
+            prompt_lib: root.clone(),
+            runtime_dir: root.join("runtime"),
+            cdper_bin: PathBuf::from("cdper-gpt-image"),
+            json: true,
+            command: Commands::Status,
+        };
+        let compiled = preference_compile(&cli).unwrap();
+        assert_eq!(compiled["ok"].as_bool(), Some(true));
+        let model: Value = read_json_file(&root.join("runtime/preference_model.json")).unwrap();
+        assert_eq!(
+            model["schema"].as_str(),
+            Some("selfiek.preference_model.v1")
+        );
+        assert!(preference_atom_delta(&model, "scene.concert") > 0);
+        assert!(preference_atom_delta(&model, "face_likeness") < 0);
+        let weights: Value = read_json_file(&root.join("runtime/weights.json")).unwrap();
+        assert_eq!(
+            weights["preference_model"]["schema"].as_str(),
+            Some("selfiek.preference_model.v1")
+        );
+        assert!(weights["preference_atom_weights"].as_array().unwrap().len() >= 2);
+        let report: Value = read_json_file(&root.join("runtime/preference_report.json")).unwrap();
+        assert_eq!(
+            report["schema"].as_str(),
+            Some("selfiek.preference_report.v1")
+        );
+        assert!(report["top_positive_elements"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| { v.get("atom").and_then(|x| x.as_str()) == Some("scene.concert") }));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn template_selection_uses_compiled_preference_model() {
+        let root = temp_path("preference-selection");
+        write_fixture_library(&root);
+        fs::write(
+            root.join("templates/tpl-alt.md"),
+            "---\nschema_version: selfiek.template.v2\nid: tpl-alt\ntitle: 备用抓拍\nstatus: active\ntype: prompt_template\nsource:\n  raw_prompt_path: sources/src-demo.md\ntaxonomy:\n  scene_ids: [scene.concert]\n  style_ids: [style.candid_snapshot]\n  camera_ids: [camera.phone]\n  composition_ids: [composition.closeup]\n  outfit_ids: [outfit.casual]\n  mood_ids: [mood.energetic]\n  effect_ids: [effect.stage_light]\ncompiler:\n  use_mode: fragments\n  priority: normal\n---\n\n# 备用抓拍\n\n## Must Keep\n- 从观众席边缘自然回头\n- 手机抓拍的轻微动感\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            dice_config: root.join("dice.json"),
+            k_original: root.join("k"),
+            new_dir: root.join("new"),
+            used_dir: root.join("used"),
+            prompt_lib: root.clone(),
+            runtime_dir: root.join("runtime"),
+            cdper_bin: PathBuf::from("cdper-gpt-image"),
+            json: true,
+            command: Commands::Status,
+        };
+        compile_templates(&cli, None, false).unwrap();
+        write_json_atomic(
+            &root.join("runtime/preference_model.json"),
+            &json!({
+                "schema":"selfiek.preference_model.v1",
+                "atom_weights":[{"atom":"template.tpl-alt","score_delta":20,"sample_count":3}],
+                "combo_weights":[],
+                "event_count":3,
+                "policy":"deterministic_offline_preference_weights_no_llm_hot_path"
+            }),
+        )
+        .unwrap();
+        let card = choose_template_card(
+            &cli,
+            &Scene {
+                id: 1,
+                name: "🎤 演唱会现场".into(),
+                prompt: "演唱会 舞台灯 荧光棒".into(),
+                openings: vec!["hi".into()],
+            },
+            &Style {
+                id: 4,
+                name: "抓拍".into(),
+                prompt: "candid snapshot phone".into(),
+            },
+            &Outfit {
+                id: 1,
+                name: "休闲".into(),
+                prompt: "casual".into(),
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            card["template_ids"].as_array().unwrap()[0].as_str(),
+            Some("tpl-alt")
+        );
+        assert!(card["explain"]["rule_hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| {
+                v.get("code").and_then(|x| x.as_str()) == Some("preference_model_applied")
+            }));
         fs::remove_dir_all(root).ok();
     }
 
