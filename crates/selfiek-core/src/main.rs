@@ -218,6 +218,38 @@ struct TemplateEntry {
     positive_weight: Option<String>,
     #[serde(default)]
     negative_weight: Option<String>,
+    #[serde(default)]
+    source_evidence: Vec<Value>,
+    #[serde(default)]
+    source_placeholders: Vec<String>,
+    #[serde(default)]
+    template_placeholders: Vec<String>,
+    #[serde(default)]
+    structured_source_keys: Vec<String>,
+    #[serde(default)]
+    preserve_top_level_keys: Vec<String>,
+    #[serde(default)]
+    raw_prompt_copy_risk: bool,
+    #[serde(default)]
+    raw_prompt_copy_fragments: Vec<String>,
+}
+#[derive(Debug, Clone)]
+struct SourceEntry {
+    path: String,
+    id: String,
+    raw_prompt: String,
+    raw_prompt_md5: String,
+    placeholders: Vec<String>,
+    structured_top_level_keys: Vec<String>,
+    risk_terms: Vec<String>,
+}
+#[derive(Debug, Serialize, Deserialize, Clone, Default)]
+struct QualitySignals {
+    prompt_injection_risks: usize,
+    raw_prompt_copy_risks: usize,
+    placeholder_preservation_warnings: usize,
+    structured_prompt_warnings: usize,
+    feedback_fact_warnings: usize,
 }
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct FragmentEntry {
@@ -260,12 +292,14 @@ struct LibraryScan {
     feedback_count: usize,
     rule_count: usize,
     image_file_count: usize,
+    sources: Vec<SourceEntry>,
     templates: Vec<TemplateEntry>,
     fragments: Vec<FragmentEntry>,
     taxonomy_ids: HashSet<String>,
     errors: Vec<Value>,
     warnings: Vec<Value>,
     legacy_templates: Vec<Value>,
+    quality_signals: QualitySignals,
 }
 
 #[derive(Debug, Serialize)]
@@ -780,6 +814,25 @@ fn template_entry_from_document(path: &Path, j: &Value, body: &str) -> TemplateE
             .and_then(|p| p.get("weight"))
             .and_then(|x| x.as_str())
             .map(|s| s.to_string()),
+        source_evidence: vec![],
+        source_placeholders: vec![],
+        template_placeholders: dedupe_strings(extract_placeholders(&format!(
+            "{}\n{}",
+            body,
+            serde_json::to_string(j).unwrap_or_default()
+        ))),
+        structured_source_keys: vec![],
+        preserve_top_level_keys: dedupe_strings(
+            nested_str_list(j, &["compiler", "preserve_top_level_keys"])
+                .into_iter()
+                .chain(nested_str_list(
+                    j,
+                    &["structured_prompt", "preserve_top_level_keys"],
+                ))
+                .collect(),
+        ),
+        raw_prompt_copy_risk: false,
+        raw_prompt_copy_fragments: vec![],
     }
 }
 
@@ -894,6 +947,309 @@ fn contains_boundary_noise(s: &str) -> bool {
     .any(|term| lower.contains(term))
 }
 
+fn extract_markdown_section_text(body: &str, section: &str) -> String {
+    let mut out = Vec::new();
+    let mut in_section = false;
+    for line in body.lines() {
+        let t = line.trim();
+        if t.starts_with('#') {
+            let title = t.trim_start_matches('#').trim().to_ascii_lowercase();
+            in_section = title == section.to_ascii_lowercase();
+            continue;
+        }
+        if in_section {
+            out.push(line);
+        }
+    }
+    out.join("\n").trim().to_string()
+}
+
+fn extract_placeholders(s: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut rest = s;
+    while let Some(start) = rest.find("{{") {
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("}}") else {
+            break;
+        };
+        let inner = after_start[..end].trim();
+        if !inner.is_empty() && inner.chars().count() <= 80 {
+            out.push(format!("{{{{{inner}}}}}"));
+        }
+        rest = &after_start[end + 2..];
+    }
+    dedupe_strings(out)
+}
+
+fn prompt_injection_terms(s: &str) -> Vec<String> {
+    let lower = s.to_ascii_lowercase();
+    let mut terms = Vec::new();
+    let compact = lower
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect::<String>();
+    for term in [
+        "```",
+        "ignore previous",
+        "system:",
+        "developer:",
+        "assistant:",
+        "negative_prompt",
+        "<system>",
+        "</system>",
+    ] {
+        if lower.contains(term) {
+            terms.push(term.to_string());
+        }
+    }
+    for term in [
+        "\"role\":\"system",
+        "\"role\":\"developer",
+        "\"role\":\"assistant",
+    ] {
+        if compact.contains(term) {
+            terms.push(term.to_string());
+        }
+    }
+    dedupe_strings(terms)
+}
+
+fn json_object_top_level_keys(s: &str) -> Vec<String> {
+    let trimmed = s.trim();
+    let Ok(Value::Object(map)) = serde_json::from_str::<Value>(trimmed) else {
+        return vec![];
+    };
+    let mut keys: Vec<_> = map.keys().cloned().collect();
+    keys.sort();
+    keys
+}
+
+fn normalized_for_copy(s: &str) -> String {
+    s.chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(|c| c.to_lowercase())
+        .collect()
+}
+
+fn raw_prompt_copy_risk(raw_prompt: &str, fragment: &str) -> bool {
+    let raw = normalized_for_copy(raw_prompt);
+    let frag = normalized_for_copy(fragment);
+    frag.chars().count() >= 50 && raw.contains(&frag)
+}
+
+fn contains_empty_quality_word(s: &str) -> bool {
+    let lower = s.to_ascii_lowercase();
+    [
+        "masterpiece",
+        "best quality",
+        "8k",
+        "hdr",
+        "c4d",
+        "octane",
+        "unreal",
+        "pixar",
+        "disney",
+        "ultra detailed",
+    ]
+    .iter()
+    .any(|term| lower.contains(term))
+}
+
+fn source_entry_from_file(root: &Path, path: &Path) -> Result<SourceEntry> {
+    let txt =
+        fs::read_to_string(path).with_context(|| format!("read source {}", path.display()))?;
+    let (j, body) =
+        parse_template_document(&txt, path).unwrap_or_else(|_| (json!({}), txt.clone()));
+    let id = opt_str_at(&j, &["id"]).unwrap_or_else(|| {
+        path.file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("source")
+            .to_string()
+    });
+    let raw_prompt = {
+        let section = extract_markdown_section_text(&body, "raw prompt");
+        if !section.is_empty() {
+            section
+        } else if !body.trim().is_empty() {
+            body.trim().to_string()
+        } else {
+            txt.trim().to_string()
+        }
+    };
+    let rel = path
+        .strip_prefix(root)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string();
+    Ok(SourceEntry {
+        path: rel,
+        id,
+        raw_prompt_md5: format!("{:x}", md5::compute(raw_prompt.as_bytes())),
+        placeholders: extract_placeholders(&raw_prompt),
+        structured_top_level_keys: json_object_top_level_keys(&raw_prompt),
+        risk_terms: prompt_injection_terms(&raw_prompt),
+        raw_prompt,
+    })
+}
+
+fn insert_source_lookup(map: &mut HashMap<String, SourceEntry>, root: &Path, source: &SourceEntry) {
+    let rel = source.path.clone();
+    map.insert(rel.clone(), source.clone());
+    map.insert(format!("raw/selfie-prompts/{rel}"), source.clone());
+    map.insert(source.id.clone(), source.clone());
+    if let Some(name) = Path::new(&rel).file_stem().and_then(|s| s.to_str()) {
+        map.insert(name.to_string(), source.clone());
+    }
+    map.insert(
+        root.join(&rel).to_string_lossy().to_string(),
+        source.clone(),
+    );
+}
+
+fn source_evidence_value(source: &SourceEntry) -> Value {
+    json!({
+        "source_id": source.id,
+        "path": source.path,
+        "raw_prompt_md5": source.raw_prompt_md5,
+        "raw_prompt_chars": source.raw_prompt.chars().count(),
+        "raw_prompt_included": false,
+        "stored_as": "json_evidence_ref",
+        "placeholders": source.placeholders,
+        "structured_top_level_keys": source.structured_top_level_keys,
+        "risk_terms": source.risk_terms
+    })
+}
+
+fn annotate_template_with_source(
+    root: &Path,
+    source_lookup: &HashMap<String, SourceEntry>,
+    entry: &mut TemplateEntry,
+    j: &Value,
+    path: &Path,
+    scan: &mut LibraryScan,
+) {
+    let Some(raw) = opt_str_at(j, &["source", "raw_prompt_path"]) else {
+        return;
+    };
+    let Some(source) = source_lookup.get(&raw).cloned().or_else(|| {
+        let rel = Path::new(&raw)
+            .strip_prefix(root)
+            .unwrap_or_else(|_| Path::new(&raw))
+            .to_string_lossy()
+            .to_string();
+        source_lookup.get(&rel).cloned()
+    }) else {
+        return;
+    };
+    entry.source_placeholders = source.placeholders.clone();
+    entry.structured_source_keys = source.structured_top_level_keys.clone();
+    entry.source_evidence.push(source_evidence_value(&source));
+
+    if !source.risk_terms.is_empty() {
+        scan.quality_signals.prompt_injection_risks += 1;
+        scan.warnings.push(json!({
+            "code":"prompt_injection_risk_in_raw_source",
+            "id":entry.id,
+            "path":path,
+            "source":source.path,
+            "risk_terms":source.risk_terms,
+            "message":"raw prompt is treated as evidence only; risky terms are not executed or copied wholesale"
+        }));
+    }
+
+    let missing_placeholders: Vec<_> = source
+        .placeholders
+        .iter()
+        .filter(|p| !entry.template_placeholders.contains(*p))
+        .cloned()
+        .collect();
+    if !missing_placeholders.is_empty() {
+        scan.quality_signals.placeholder_preservation_warnings += 1;
+        scan.warnings.push(json!({
+            "code":"source_placeholders_not_preserved",
+            "id":entry.id,
+            "path":path,
+            "source":source.path,
+            "missing_placeholders":missing_placeholders
+        }));
+    }
+
+    let raw_copy_fragments: Vec<String> = entry
+        .fragment_texts
+        .iter()
+        .chain(entry.avoid.iter())
+        .filter(|text| raw_prompt_copy_risk(&source.raw_prompt, text))
+        .cloned()
+        .collect();
+    if !raw_copy_fragments.is_empty() {
+        entry.raw_prompt_copy_risk = true;
+        entry.raw_prompt_copy_fragments = raw_copy_fragments;
+        scan.quality_signals.raw_prompt_copy_risks += 1;
+        scan.warnings.push(json!({
+            "code":"raw_prompt_copy_risk",
+            "id":entry.id,
+            "path":path,
+            "source":source.path,
+            "message":"fragment resembles the raw source prompt; split into smaller reusable ingredients"
+        }));
+    }
+
+    if !source.structured_top_level_keys.is_empty() {
+        let missing_keys: Vec<_> = source
+            .structured_top_level_keys
+            .iter()
+            .filter(|k| !entry.preserve_top_level_keys.contains(*k))
+            .cloned()
+            .collect();
+        if !missing_keys.is_empty() {
+            scan.quality_signals.structured_prompt_warnings += 1;
+            scan.warnings.push(json!({
+                "code":"structured_prompt_keys_not_preserved",
+                "id":entry.id,
+                "path":path,
+                "source":source.path,
+                "source_top_level_keys":source.structured_top_level_keys,
+                "declared_preserve_top_level_keys":entry.preserve_top_level_keys,
+                "missing_keys":missing_keys
+            }));
+        }
+    }
+}
+
+fn lint_feedback_visible_facts(
+    j: &Value,
+    entry: &TemplateEntry,
+    path: &Path,
+    scan: &mut LibraryScan,
+) {
+    let visual_note = opt_str_at(j, &["source", "visual_note"]).unwrap_or_default();
+    if visual_note.chars().count() < 8 {
+        scan.quality_signals.feedback_fact_warnings += 1;
+        scan.warnings.push(json!({
+            "code":"feedback_visible_fact_missing",
+            "id":entry.id,
+            "path":path,
+            "message":"feedback templates should record a concrete visual_note after vision inspection"
+        }));
+    }
+    let mut atoms = Vec::new();
+    if let Some(x) = j.get("positive_signal") {
+        collect_strings(x, &mut atoms);
+    }
+    if let Some(x) = j.get("negative_signal") {
+        collect_strings(x, &mut atoms);
+    }
+    if atoms.iter().any(|s| contains_empty_quality_word(s)) {
+        scan.quality_signals.feedback_fact_warnings += 1;
+        scan.warnings.push(json!({
+            "code":"empty_quality_word_in_feedback",
+            "id":entry.id,
+            "path":path,
+            "message":"feedback should name visible facts instead of generic quality slogans"
+        }));
+    }
+}
+
 fn library_scan(cli: &Cli) -> Result<LibraryScan> {
     let root = &cli.prompt_lib;
     let mut scan = LibraryScan {
@@ -905,12 +1261,14 @@ fn library_scan(cli: &Cli) -> Result<LibraryScan> {
         feedback_count: note_files(&root.join("feedback"), true).len(),
         rule_count: note_files(&root.join("rules"), true).len(),
         image_file_count: image_files(root).len(),
+        sources: vec![],
         templates: vec![],
         fragments: vec![],
         taxonomy_ids: load_taxonomy_ids(root)?,
         errors: vec![],
         warnings: vec![],
         legacy_templates: vec![],
+        quality_signals: QualitySignals::default(),
     };
     if !root.exists() {
         scan.errors
@@ -930,6 +1288,19 @@ fn library_scan(cli: &Cli) -> Result<LibraryScan> {
             .push(json!({"code":"missing_safety_rules","path":root.join("rules/safety.yaml")}));
     }
 
+    let mut source_lookup: HashMap<String, SourceEntry> = HashMap::new();
+    for path in note_files(&root.join("sources"), true) {
+        match source_entry_from_file(root, &path) {
+            Ok(source) => {
+                insert_source_lookup(&mut source_lookup, root, &source);
+                scan.sources.push(source);
+            }
+            Err(e) => scan
+                .errors
+                .push(json!({"code":"parse_source_failed","path":path,"error":e.to_string()})),
+        }
+    }
+
     let mut template_ids = HashSet::new();
     for path in yaml_files(&root.join("templates")) {
         let txt = fs::read_to_string(&path)?;
@@ -942,7 +1313,8 @@ fn library_scan(cli: &Cli) -> Result<LibraryScan> {
                 continue;
             }
         };
-        let entry = template_entry_from_document(&path, &j, &body);
+        let mut entry = template_entry_from_document(&path, &j, &body);
+        annotate_template_with_source(root, &source_lookup, &mut entry, &j, &path, &mut scan);
         if !template_ids.insert(entry.id.clone()) {
             scan.errors
                 .push(json!({"code":"duplicate_template_id","id":entry.id,"path":path}));
@@ -976,6 +1348,7 @@ fn library_scan(cli: &Cli) -> Result<LibraryScan> {
                     {
                         scan.errors.push(json!({"code":"feedback_requires_visual_checked","id":entry.id,"path":path}));
                     }
+                    lint_feedback_visible_facts(&j, &entry, &path, &mut scan);
                 }
                 if !scan.taxonomy_ids.is_empty() {
                     for tax in &entry.taxonomy_ids {
@@ -1069,6 +1442,7 @@ fn library_lint(cli: &Cli) -> Result<Value> {
         },
         "errors": scan.errors,
         "warnings": scan.warnings,
+        "quality_signals": scan.quality_signals,
         "legacy_needs_migration": scan.legacy_templates
     }))
 }
@@ -1113,22 +1487,108 @@ fn write_jsonl_atomic(path: &Path, rows: &[Value]) -> Result<()> {
 }
 
 fn build_prompt_card_for_template(t: &TemplateEntry) -> Value {
-    let fragment_ids: Vec<String> = (0..t.fragment_texts.len().min(8))
+    let fragments: Vec<String> = t
+        .fragment_texts
+        .iter()
+        .filter(|fragment| !t.raw_prompt_copy_fragments.contains(*fragment))
+        .take(8)
+        .cloned()
+        .collect();
+    let fragment_ids: Vec<String> = (0..fragments.len())
         .map(|idx| format!("{}.fragment.{:03}", t.id, idx + 1))
         .collect();
+    let mut required_placeholders = t.source_placeholders.clone();
+    required_placeholders.extend(t.template_placeholders.clone());
+    required_placeholders = dedupe_strings(required_placeholders);
+    let present_placeholders = dedupe_strings(extract_placeholders(&fragments.join("\n")));
+    let missing_placeholders: Vec<String> = required_placeholders
+        .iter()
+        .filter(|p| !present_placeholders.contains(*p))
+        .cloned()
+        .collect();
+    let placeholder_status = if missing_placeholders.is_empty() {
+        "ok"
+    } else {
+        "missing"
+    };
+    let mut rule_hits = vec![json!({
+        "code":"raw_prompt_wrapped_as_evidence",
+        "status":"ok",
+        "raw_prompt_included":false,
+        "source_count":t.source_evidence.len()
+    })];
+    if !required_placeholders.is_empty() && missing_placeholders.is_empty() {
+        rule_hits.push(json!({
+            "code":"placeholder_preserved",
+            "status":"ok",
+            "count":required_placeholders.len()
+        }));
+    } else if !missing_placeholders.is_empty() {
+        rule_hits.push(json!({
+            "code":"placeholder_missing",
+            "status":"warning",
+            "missing":missing_placeholders
+        }));
+    }
+    if t.raw_prompt_copy_risk {
+        rule_hits.push(json!({
+            "code":"raw_prompt_copy_risk",
+            "status":"warning",
+            "filtered_fragment_count":t.raw_prompt_copy_fragments.len()
+        }));
+    }
+    if !t.structured_source_keys.is_empty() {
+        let missing_keys: Vec<_> = t
+            .structured_source_keys
+            .iter()
+            .filter(|k| !t.preserve_top_level_keys.contains(*k))
+            .cloned()
+            .collect();
+        rule_hits.push(json!({
+            "code":"structured_prompt_keys_checked",
+            "status": if missing_keys.is_empty() { "ok" } else { "warning" },
+            "source_top_level_keys":t.structured_source_keys,
+            "declared_preserve_top_level_keys":t.preserve_top_level_keys,
+            "missing_keys":missing_keys
+        }));
+    }
     json!({
         "schema_version":"selfiek.prompt_card.v2",
         "template_ids":[t.id.clone()],
         "fragment_ids":fragment_ids,
         "source_ids":t.source_ids,
+        "source_evidence":t.source_evidence,
         "k_image_ids":[],
         "taxonomy_ids":t.taxonomy_ids,
         "weights_applied":[],
-        "negative_rules":t.avoid.iter().take(8).cloned().collect::<Vec<_>>(),
-        "fragments":t.fragment_texts.iter().take(8).cloned().collect::<Vec<_>>(),
+        "negative_rules":t
+            .avoid
+            .iter()
+            .filter(|rule| !t.raw_prompt_copy_fragments.contains(*rule))
+            .take(8)
+            .cloned()
+            .collect::<Vec<_>>(),
+        "fragments":fragments,
         "template_path":t.path,
         "use_mode":t.use_mode,
-        "priority":t.priority
+        "priority":t.priority,
+        "guardrails":{
+            "raw_prompt_included": false,
+            "raw_prompt_copy_risk": t.raw_prompt_copy_risk,
+            "raw_prompt_policy":"source_evidence_ref_only",
+            "placeholder_preservation": placeholder_status
+        },
+        "placeholders":{
+            "required":required_placeholders,
+            "present":present_placeholders,
+            "missing":missing_placeholders,
+            "status":placeholder_status
+        },
+        "explain":{
+            "rule_hits":rule_hits,
+            "reject_reasons":[],
+            "source_copy_policy":"raw source text is never copied wholesale into prompt cards"
+        }
     })
 }
 
@@ -1154,6 +1614,7 @@ fn library_report_value(cli: &Cli, use_orderk: bool) -> Result<Value> {
         },
         "warnings": scan.warnings,
         "errors": scan.errors,
+        "quality_signals": scan.quality_signals,
         "legacy_needs_migration": scan.legacy_templates
     }))
 }
@@ -1228,6 +1689,7 @@ fn compile_templates(cli: &Cli, out: Option<PathBuf>, use_orderk: bool) -> Resul
         "prompt_card_count": cards.len(),
         "warning_count": scan.warnings.len(),
         "error_count": scan.errors.len(),
+        "quality_signals": scan.quality_signals,
         "warnings": scan.warnings,
         "errors": scan.errors,
         "orderk": orderk_probe(use_orderk)
@@ -1392,25 +1854,20 @@ fn choose_template_card(cli: &Cli, scene: &Scene, style: &Style, outfit: &Outfit
         .collect();
     scored.sort_by_key(|item| std::cmp::Reverse(item.0));
     let (score, best) = scored.first()?;
-    let fragments: Vec<_> = best.fragment_texts.iter().take(6).cloned().collect();
-    let fragment_ids: Vec<_> = (0..fragments.len())
-        .map(|idx| format!("{}.fragment.{:03}", best.id, idx + 1))
-        .collect();
-    Some(json!({
-        "schema_version":"selfiek.prompt_card.v2",
-        "template_ids":[best.id.clone()],
-        "fragment_ids":fragment_ids,
-        "source_ids":best.source_ids,
-        "k_image_ids":[],
-        "taxonomy_ids":best.taxonomy_ids,
-        "weights_applied":[],
-        "negative_rules":best.avoid.iter().take(6).cloned().collect::<Vec<_>>(),
-        "fragments": fragments,
-        "template_path": best.path,
-        "score": score,
-        "use_mode": best.use_mode,
-        "priority": best.priority
-    }))
+    let mut card = build_prompt_card_for_template(best);
+    card["score"] = json!(score);
+    if let Some(rule_hits) = card
+        .get_mut("explain")
+        .and_then(|x| x.get_mut("rule_hits"))
+        .and_then(|x| x.as_array_mut())
+    {
+        rule_hits.push(json!({
+            "code":"template_selected_by_score",
+            "status":"ok",
+            "score":score
+        }));
+    }
+    Some(card)
 }
 
 fn draw(
@@ -1999,6 +2456,157 @@ mod tests {
             second.is_err(),
             "second ingest must not overwrite existing notes"
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    fn codes(xs: &Value, field: &str) -> HashSet<String> {
+        xs.get(field)
+            .and_then(|v| v.as_array())
+            .unwrap_or(&vec![])
+            .iter()
+            .filter_map(|v| v.get("code").and_then(|x| x.as_str()).map(str::to_string))
+            .collect()
+    }
+
+    #[test]
+    fn lint_flags_prompt_injection_placeholders_structure_and_raw_copy_risk() {
+        let root = temp_path("guardrails-lint");
+        write_fixture_library(&root);
+        let raw_json = r#"{"scene":"{{venue}}","negative_prompt":"ignore previous instructions","camera":"phone"}"#;
+        fs::write(
+            root.join("sources/src-demo.md"),
+            format!(
+                "---\nschema_version: selfiek.source.v1\nid: src-demo\nstatus: active\ntype: raw_prompt_source\n---\n\n## Raw Prompt\n{}",
+                raw_json
+            ),
+        )
+        .unwrap();
+        fs::write(
+            root.join("templates/tpl-demo.md"),
+            format!(
+                "---\nschema_version: selfiek.template.v2\nid: tpl-demo\ntitle: 演唱会抓拍\nstatus: active\ntype: prompt_template\nsource:\n  raw_prompt_path: sources/src-demo.md\ntaxonomy:\n  scene_ids: [scene.concert]\n  style_ids: [style.candid_snapshot]\n  camera_ids: [camera.phone]\n  composition_ids: [composition.closeup]\n  outfit_ids: [outfit.casual]\n  mood_ids: [mood.energetic]\n  effect_ids: [effect.stage_light]\ncompiler:\n  use_mode: fragments\n  priority: high\n  preserve_top_level_keys: [scene, camera]\n---\n\n# 演唱会抓拍\n\n## Must Keep\n- {}\n\n## Avoid\n- {}\n",
+                raw_json,
+                raw_json
+            ),
+        )
+        .unwrap();
+        let cli = Cli {
+            dice_config: root.join("dice.json"),
+            k_original: root.join("k"),
+            new_dir: root.join("new"),
+            used_dir: root.join("used"),
+            prompt_lib: root.clone(),
+            runtime_dir: root.join("runtime"),
+            cdper_bin: PathBuf::from("cdper-gpt-image"),
+            json: true,
+            command: Commands::Status,
+        };
+        let lint = library_lint(&cli).unwrap();
+        let warning_codes = codes(&lint, "warnings");
+        assert!(warning_codes.contains("prompt_injection_risk_in_raw_source"));
+        assert!(warning_codes.contains("raw_prompt_copy_risk"));
+        assert!(warning_codes.contains("structured_prompt_keys_not_preserved"));
+        let signals = lint["quality_signals"].as_object().unwrap();
+        assert_eq!(signals["prompt_injection_risks"].as_u64(), Some(1));
+        assert_eq!(signals["raw_prompt_copy_risks"].as_u64(), Some(1));
+        let compiled = compile_templates(&cli, None, false).unwrap();
+        assert_eq!(compiled.get("ok").and_then(|x| x.as_bool()), Some(true));
+        let cards = fs::read_to_string(root.join("runtime/prompt_cards.jsonl")).unwrap();
+        assert!(!cards.contains(raw_json));
+        let first_card: Value = serde_json::from_str(cards.lines().next().unwrap()).unwrap();
+        assert!(!first_card["fragments"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some(raw_json)));
+        assert!(!first_card["negative_rules"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.as_str() == Some(raw_json)));
+        assert_eq!(
+            first_card["guardrails"]["raw_prompt_copy_risk"].as_bool(),
+            Some(true)
+        );
+        assert!(first_card["explain"]["rule_hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v.get("code").and_then(|x| x.as_str()) == Some("raw_prompt_copy_risk")));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn prompt_card_explains_placeholder_preservation_without_raw_prompt_body() {
+        let root = temp_path("guardrails-card");
+        write_fixture_library(&root);
+        fs::write(
+            root.join("sources/src-demo.md"),
+            "---\nschema_version: selfiek.source.v1\nid: src-demo\nstatus: active\ntype: raw_prompt_source\n---\n\n## Raw Prompt\n演唱会里 {{stage_color}} 舞台灯扫过侧脸",
+        )
+        .unwrap();
+        fs::write(
+            root.join("templates/tpl-demo.md"),
+            "---\nschema_version: selfiek.template.v2\nid: tpl-demo\ntitle: 演唱会抓拍\nstatus: active\ntype: prompt_template\nsource:\n  raw_prompt_path: sources/src-demo.md\ntaxonomy:\n  scene_ids: [scene.concert]\n  style_ids: [style.candid_snapshot]\n  camera_ids: [camera.phone]\n  composition_ids: [composition.closeup]\n  outfit_ids: [outfit.casual]\n  mood_ids: [mood.energetic]\n  effect_ids: [effect.stage_light]\ncompiler:\n  use_mode: fragments\n  priority: high\n---\n\n# 演唱会抓拍\n\n## Must Keep\n- {{stage_color}} 舞台灯扫过脸侧\n- 人群背景里有荧光棒\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            dice_config: root.join("dice.json"),
+            k_original: root.join("k"),
+            new_dir: root.join("new"),
+            used_dir: root.join("used"),
+            prompt_lib: root.clone(),
+            runtime_dir: root.join("runtime"),
+            cdper_bin: PathBuf::from("cdper-gpt-image"),
+            json: true,
+            command: Commands::Status,
+        };
+        let compiled = compile_templates(&cli, None, false).unwrap();
+        assert_eq!(compiled.get("ok").and_then(|x| x.as_bool()), Some(true));
+        let card = build_prompt_card_for_template(&library_scan(&cli).unwrap().templates[0]);
+        assert_eq!(
+            card["guardrails"]["raw_prompt_included"].as_bool(),
+            Some(false)
+        );
+        assert_eq!(card["placeholders"]["status"].as_str(), Some("ok"));
+        assert_eq!(
+            card["placeholders"]["required"].as_array().unwrap()[0].as_str(),
+            Some("{{stage_color}}")
+        );
+        assert!(card["explain"]["rule_hits"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| { v.get("code").and_then(|x| x.as_str()) == Some("placeholder_preserved") }));
+        let rendered = serde_json::to_string(&card).unwrap();
+        assert!(!rendered.contains("演唱会里 {{stage_color}} 舞台灯扫过侧脸"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn feedback_lint_warns_when_visual_note_is_not_fact_based() {
+        let root = temp_path("guardrails-feedback");
+        write_fixture_library(&root);
+        fs::write(
+            root.join("templates/tpl-feedback.md"),
+            "---\nschema_version: selfiek.template.v2\nid: tpl-feedback\ntitle: 空洞正反馈\nstatus: active\ntype: positive_feedback\nsource:\n  source_image: /tmp/demo.png\n  source_metadata: /tmp/demo.json\n  visual_checked: true\npositive_signal:\n  weight: high\n  keep: [masterpiece, best quality, 8k]\n---\n\n# 空洞正反馈\n",
+        )
+        .unwrap();
+        let cli = Cli {
+            dice_config: root.join("dice.json"),
+            k_original: root.join("k"),
+            new_dir: root.join("new"),
+            used_dir: root.join("used"),
+            prompt_lib: root.clone(),
+            runtime_dir: root.join("runtime"),
+            cdper_bin: PathBuf::from("cdper-gpt-image"),
+            json: true,
+            command: Commands::Status,
+        };
+        let lint = library_lint(&cli).unwrap();
+        let warning_codes = codes(&lint, "warnings");
+        assert!(warning_codes.contains("feedback_visible_fact_missing"));
+        assert!(warning_codes.contains("empty_quality_word_in_feedback"));
         fs::remove_dir_all(root).ok();
     }
 

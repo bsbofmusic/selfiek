@@ -21,3 +21,5 @@ selfiek cleanup-used --json
 The package bundles a Linux x64 Rust core binary. On other platforms set `SELFIEK_CORE_BIN` to a compatible `selfiek-core` binary.
 
 SelfieK reuses `cdper-gpt-image` for actual ChatGPT/CDP image generation.
+
+Prompt-library guardrails are intentionally lightweight: `library lint/report` can surface prompt-injection-like raw source text, raw-copy risk, placeholder preservation state, structured JSON key preservation hints, and feedback visible-fact warnings. The package does not include an LLM prompt optimizer, UI, daemon, MCP optimize tool, or image-generation backend.
