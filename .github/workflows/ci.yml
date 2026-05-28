@@ -23,10 +23,10 @@ jobs:
           node-version: '22'
           cache: 'npm'
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - run: rustup component add clippy rustfmt
       - run: npm ci
       - run: node packages/selfiek/scripts/create-ci-fixture.mjs /tmp/selfiek-ci
+      - run: cargo fmt --check
       - run: cargo clippy --workspace -- -D warnings
       - run: cargo test --workspace
       - run: npm run build --workspace selfiek

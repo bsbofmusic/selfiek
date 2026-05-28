@@ -28,8 +28,10 @@ jobs:
       - name: Use npm with OIDC support
         run: npm install -g npm@latest
       - uses: dtolnay/rust-toolchain@stable
+      - run: rustup component add rustfmt
       - run: npm ci
       - run: node packages/selfiek/scripts/create-ci-fixture.mjs /tmp/selfiek-ci
+      - run: cargo fmt --check
       - run: cargo test --workspace
       - run: npm run build --workspace selfiek
       - run: npm test --workspace selfiek
