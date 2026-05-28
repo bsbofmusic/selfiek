@@ -1,6 +1,6 @@
 {
   "name": "selfiek",
-  "version": "3.8.1",
+  "version": "3.9.0",
   "description": "SelfieK CLI: Rust+TypeScript orchestration for the K/Kate selfie pipeline",
   "license": "MIT",
   "author": "bsbofmusic",

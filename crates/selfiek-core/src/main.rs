@@ -7,19 +7,36 @@ use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::env;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
-const VERSION: &str = "3.8.1";
+const VERSION: &str = "3.9.0";
 const REF_IMAGE_PREFIX: &str = "请直接生成一张全新的写实摄影风格图片，不要回复文字，不要解释。参考拼图包含 3 张同一角色照片，仅作为面部特征和发型气质参考。请完全忽略参考图中的服装、姿势、背景、光线和拍摄角度。你需要生成一个全新的、独立的场景和构图，只保留图中人物的稳定面部特征（脸型、五官比例、肤质、发色）。";
 const NEGATIVE_SUFFIX: &str = "\n\n[Important constraints] Must avoid: deformed fingers, extra fingers, fused fingers, backwards fingers, mutated hands, poorly drawn hands, malformed limbs, extra arms, extra legs, fused legs, too many fingers, long neck, distorted face, asymmetric eyes, cross-eyed, cloned face, ugly, disfigured, blurry, low quality, pixelated, watermark, text overlay, over-processed, plastic skin, waxy appearance, uncanny valley, AI artifacts, unrealistic proportions, cartoon, anime, 3d render.";
 
 #[derive(Parser, Debug)]
 #[command(name = "selfiek-core", version = VERSION, about = "Rust core for SelfieK")]
 struct Cli {
+    #[arg(
+        long,
+        global = true,
+        env = "SELFIEK_PROFILE",
+        default_value = "k-selfie"
+    )]
+    profile: String,
+    #[arg(long, global = true, env = "SELFIEK_PROFILE_FILE")]
+    profile_file: Option<PathBuf>,
+    #[arg(
+        long,
+        global = true,
+        env = "SELFIEK_STOCK_LIMIT",
+        default_value_t = 100
+    )]
+    stock_limit: usize,
     #[arg(
         long,
         global = true,
@@ -97,6 +114,10 @@ enum Commands {
         #[command(subcommand)]
         command: PreferenceCommands,
     },
+    Profile {
+        #[command(subcommand)]
+        command: ProfileCommands,
+    },
     Draw {
         #[arg(long)]
         scene: Option<u32>,
@@ -124,8 +145,6 @@ enum Commands {
         dry_run: bool,
         #[arg(long)]
         quiet: bool,
-        #[arg(long)]
-        out_dir: Option<PathBuf>,
     },
     Produce {
         #[arg(long)]
@@ -144,6 +163,15 @@ enum Commands {
         days: i64,
     },
     Version,
+}
+
+#[derive(Subcommand, Debug)]
+enum ProfileCommands {
+    Show,
+    Validate {
+        #[arg(long)]
+        file: Option<PathBuf>,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -368,6 +396,44 @@ struct IdName {
     name: String,
 }
 
+#[derive(Debug, Deserialize, Default, Clone)]
+struct ProfileManifest {
+    schema_version: Option<String>,
+    id: Option<String>,
+    display_name: Option<String>,
+    paths: Option<ProfilePaths>,
+    stock: Option<ProfileStock>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct ProfilePaths {
+    dice_config: Option<PathBuf>,
+    reference_dir: Option<PathBuf>,
+    new_dir: Option<PathBuf>,
+    used_dir: Option<PathBuf>,
+    prompt_lib: Option<PathBuf>,
+    runtime_dir: Option<PathBuf>,
+    cdper_bin: Option<PathBuf>,
+}
+
+#[derive(Debug, Deserialize, Default, Clone)]
+struct ProfileStock {
+    new_limit: Option<usize>,
+}
+
+#[derive(Debug, Default)]
+struct OverrideSources {
+    profile: bool,
+    dice_config: bool,
+    k_original: bool,
+    new_dir: bool,
+    used_dir: bool,
+    prompt_lib: bool,
+    runtime_dir: bool,
+    cdper_bin: bool,
+    stock_limit: bool,
+}
+
 fn main() {
     if let Err(e) = run() {
         println!("{}", json!({"ok": false, "error": e.to_string()}));
@@ -376,7 +442,7 @@ fn main() {
 }
 
 fn run() -> Result<()> {
-    let cli = Cli::parse();
+    let cli = apply_profile(Cli::parse())?;
     match &cli.command {
         Commands::Status => emit(status(&cli)?, true),
         Commands::ValidateConfig => emit(validate_report(&cli.dice_config)?, true),
@@ -386,6 +452,7 @@ fn run() -> Result<()> {
         Commands::Library { command } => emit(library_command(&cli, command)?, true),
         Commands::Feedback { command } => emit(feedback_command(&cli, command)?, true),
         Commands::Preference { command } => emit(preference_command(&cli, command)?, true),
+        Commands::Profile { command } => emit(profile_command(&cli, command)?, true),
         Commands::Draw {
             scene,
             style,
@@ -404,7 +471,6 @@ fn run() -> Result<()> {
             explain: _,
             dry_run,
             quiet,
-            out_dir,
         } => emit(
             generate(
                 &cli,
@@ -414,7 +480,7 @@ fn run() -> Result<()> {
                 *use_templates,
                 *dry_run,
                 *quiet,
-                out_dir.clone(),
+                None,
             )?,
             true,
         ),
@@ -435,6 +501,182 @@ fn run() -> Result<()> {
 
 fn emit(v: Value, _json: bool) {
     println!("{}", serde_json::to_string_pretty(&v).unwrap());
+}
+
+fn has_cli_flag(flag: &str) -> bool {
+    let eq = format!("{}=", flag);
+    env::args_os().any(|arg| {
+        let s = arg.to_string_lossy();
+        s == flag || s.starts_with(&eq)
+    })
+}
+
+fn override_sources_from_process() -> OverrideSources {
+    OverrideSources {
+        profile: has_cli_flag("--profile") || env::var_os("SELFIEK_PROFILE").is_some(),
+        dice_config: has_cli_flag("--dice-config") || env::var_os("SELFIEK_DICE_CONFIG").is_some(),
+        k_original: has_cli_flag("--k-original") || env::var_os("SELFIEK_K_ORIGINAL").is_some(),
+        new_dir: has_cli_flag("--new-dir") || env::var_os("SELFIEK_NEW_DIR").is_some(),
+        used_dir: has_cli_flag("--used-dir") || env::var_os("SELFIEK_USED_DIR").is_some(),
+        prompt_lib: has_cli_flag("--prompt-lib") || env::var_os("SELFIEK_PROMPT_LIB").is_some(),
+        runtime_dir: has_cli_flag("--runtime-dir") || env::var_os("SELFIEK_RUNTIME_DIR").is_some(),
+        cdper_bin: has_cli_flag("--cdper-bin") || env::var_os("SELFIEK_CDPER_BIN").is_some(),
+        stock_limit: has_cli_flag("--stock-limit") || env::var_os("SELFIEK_STOCK_LIMIT").is_some(),
+    }
+}
+
+fn resolve_profile_path(base: &Path, value: PathBuf) -> PathBuf {
+    if value.is_absolute() {
+        value
+    } else {
+        base.join(value)
+    }
+}
+
+fn load_profile_manifest(path: &Path) -> Result<ProfileManifest> {
+    let s = fs::read_to_string(path).with_context(|| format!("read profile {}", path.display()))?;
+    let manifest: ProfileManifest = serde_yaml::from_str(&s)
+        .with_context(|| format!("parse profile manifest {}", path.display()))?;
+    validate_profile_manifest(&manifest)?;
+    Ok(manifest)
+}
+
+fn validate_profile_manifest(manifest: &ProfileManifest) -> Result<()> {
+    if manifest.schema_version.as_deref() != Some("selfiek.profile.v1") {
+        bail!("profile schema_version must be selfiek.profile.v1");
+    }
+    let id = manifest.id.as_deref().unwrap_or("").trim();
+    if id.is_empty() {
+        bail!("profile id is required");
+    }
+    if let Some(stock) = &manifest.stock {
+        if matches!(stock.new_limit, Some(0)) {
+            bail!("profile stock.new_limit must be greater than 0");
+        }
+    }
+    Ok(())
+}
+
+fn apply_profile(cli: Cli) -> Result<Cli> {
+    let sources = override_sources_from_process();
+    apply_profile_with_sources(cli, &sources)
+}
+
+fn apply_profile_with_sources(mut cli: Cli, sources: &OverrideSources) -> Result<Cli> {
+    if let Some(profile_file) = cli.profile_file.clone() {
+        let manifest = load_profile_manifest(&profile_file)?;
+        let base = profile_file.parent().unwrap_or_else(|| Path::new("."));
+        if !sources.profile {
+            if let Some(id) = manifest.id.as_deref() {
+                cli.profile = id.to_string();
+            }
+        }
+        if let Some(paths) = manifest.paths {
+            if !sources.dice_config {
+                if let Some(v) = paths.dice_config {
+                    cli.dice_config = resolve_profile_path(base, v);
+                }
+            }
+            if !sources.k_original {
+                if let Some(v) = paths.reference_dir {
+                    cli.k_original = resolve_profile_path(base, v);
+                }
+            }
+            if !sources.new_dir {
+                if let Some(v) = paths.new_dir {
+                    cli.new_dir = resolve_profile_path(base, v);
+                }
+            }
+            if !sources.used_dir {
+                if let Some(v) = paths.used_dir {
+                    cli.used_dir = resolve_profile_path(base, v);
+                }
+            }
+            if !sources.prompt_lib {
+                if let Some(v) = paths.prompt_lib {
+                    cli.prompt_lib = resolve_profile_path(base, v);
+                }
+            }
+            if !sources.runtime_dir {
+                if let Some(v) = paths.runtime_dir {
+                    cli.runtime_dir = resolve_profile_path(base, v);
+                }
+            }
+            if !sources.cdper_bin {
+                if let Some(v) = paths.cdper_bin {
+                    cli.cdper_bin = resolve_profile_path(base, v);
+                }
+            }
+        }
+        if let Some(stock) = manifest.stock {
+            if !sources.stock_limit {
+                if let Some(limit) = stock.new_limit {
+                    cli.stock_limit = limit;
+                }
+            }
+        }
+    }
+    if cli.stock_limit == 0 {
+        bail!("stock limit must be greater than 0");
+    }
+    Ok(cli)
+}
+
+fn profile_value(cli: &Cli) -> Value {
+    json!({
+        "schema":"selfiek.profile.resolved.v1",
+        "id":cli.profile,
+        "source":cli.profile_file.as_ref().map(|p| p.to_string_lossy().to_string()).unwrap_or_else(|| "defaults/env/cli".to_string()),
+        "scope":"stock_only",
+        "ad_hoc_generation":"external_cdper",
+        "stock":{"new_limit":cli.stock_limit},
+        "paths":{
+            "dice_config":cli.dice_config,
+            "reference_dir":cli.k_original,
+            "new_dir":cli.new_dir,
+            "used_dir":cli.used_dir,
+            "prompt_lib":cli.prompt_lib,
+            "runtime_dir":cli.runtime_dir,
+            "cdper_bin":cli.cdper_bin
+        }
+    })
+}
+
+fn profile_manifest_value(path: &Path, manifest: &ProfileManifest) -> Value {
+    let base = path.parent().unwrap_or_else(|| Path::new("."));
+    let paths = manifest.paths.clone().unwrap_or_default();
+    json!({
+        "schema":"selfiek.profile.validation.v1",
+        "ok":true,
+        "file":path,
+        "id":manifest.id,
+        "display_name":manifest.display_name,
+        "scope":"stock_only",
+        "paths":{
+            "dice_config":paths.dice_config.map(|v| resolve_profile_path(base, v)),
+            "reference_dir":paths.reference_dir.map(|v| resolve_profile_path(base, v)),
+            "new_dir":paths.new_dir.map(|v| resolve_profile_path(base, v)),
+            "used_dir":paths.used_dir.map(|v| resolve_profile_path(base, v)),
+            "prompt_lib":paths.prompt_lib.map(|v| resolve_profile_path(base, v)),
+            "runtime_dir":paths.runtime_dir.map(|v| resolve_profile_path(base, v)),
+            "cdper_bin":paths.cdper_bin.map(|v| resolve_profile_path(base, v))
+        },
+        "stock":{"new_limit":manifest.stock.as_ref().and_then(|s| s.new_limit)}
+    })
+}
+
+fn profile_command(cli: &Cli, command: &ProfileCommands) -> Result<Value> {
+    match command {
+        ProfileCommands::Show => Ok(json!({"ok":true,"profile":profile_value(cli)})),
+        ProfileCommands::Validate { file } => {
+            let path = file
+                .as_ref()
+                .or(cli.profile_file.as_ref())
+                .ok_or_else(|| anyhow!("profile validate requires --file or --profile-file"))?;
+            let manifest = load_profile_manifest(path)?;
+            Ok(profile_manifest_value(path, &manifest))
+        }
+    }
 }
 
 fn ensure_dirs(cli: &Cli) -> Result<()> {
@@ -560,9 +802,32 @@ fn validate_report(path: &Path) -> Result<Value> {
 fn status(cli: &Cli) -> Result<Value> {
     ensure_dirs(cli)?;
     let vr = validate_report(&cli.dice_config)?;
-    Ok(
-        json!({"ok": true, "version": VERSION, "runtime_version": VERSION, "new": image_files(&cli.new_dir).len(), "new_limit": 100, "used": image_files(&cli.used_dir).len(), "k_original": image_files(&cli.k_original).len(), "templates": yaml_files(&cli.prompt_lib.join("templates")).len(), "dice_config": vr, "paths": {"K-original": cli.k_original, "k-selfie-new": cli.new_dir, "k-selfie-used": cli.used_dir, "prompt_lib": cli.prompt_lib, "runtime_dir": cli.runtime_dir}}),
-    )
+    let new_count = image_files(&cli.new_dir).len();
+    let used_count = image_files(&cli.used_dir).len();
+    let k_count = image_files(&cli.k_original).len();
+    Ok(json!({
+        "ok": true,
+        "version": VERSION,
+        "runtime_version": VERSION,
+        "profile": profile_value(cli),
+        "stock": {"new": new_count, "used": used_count, "new_limit": cli.stock_limit},
+        "new": new_count,
+        "new_limit": cli.stock_limit,
+        "used": used_count,
+        "k_original": k_count,
+        "templates": yaml_files(&cli.prompt_lib.join("templates")).len(),
+        "dice_config": vr,
+        "paths": {
+            "K-original": cli.k_original,
+            "k-selfie-new": cli.new_dir,
+            "k-selfie-used": cli.used_dir,
+            "reference_dir": cli.k_original,
+            "new_dir": cli.new_dir,
+            "used_dir": cli.used_dir,
+            "prompt_lib": cli.prompt_lib,
+            "runtime_dir": cli.runtime_dir
+        }
+    }))
 }
 fn yaml_files(dir: &Path) -> Vec<PathBuf> {
     if !dir.exists() {
@@ -3014,7 +3279,7 @@ fn consume_stock(cli: &Cli) -> Result<Value> {
     lock.lock_exclusive()?;
     let files = image_files(&cli.new_dir);
     if files.is_empty() {
-        bail!("k-selfie-new is empty");
+        bail!("stock_empty: new_dir is empty");
     }
     let oldest = &files[0];
     let meta_src = oldest.with_extension("json");
@@ -3048,29 +3313,18 @@ fn consume_stock(cli: &Cli) -> Result<Value> {
     )
 }
 
-fn next(cli: &Cli, use_templates: bool) -> Result<Value> {
+fn next(cli: &Cli, _use_templates: bool) -> Result<Value> {
     match consume_stock(cli) {
         Ok(v) => Ok(v),
-        Err(_) => {
-            let gen = generate(
-                cli,
-                None,
-                None,
-                None,
-                use_templates,
-                false,
-                true,
-                Some(cli.new_dir.clone()),
-            )?;
-            if !gen.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
-                return Ok(
-                    json!({"ok": false, "error": "stock empty and emergency generation failed", "generation": gen}),
-                );
-            }
-            let mut v = consume_stock(cli)?;
-            v["source"] = json!("emergency_generated");
-            Ok(v)
-        }
+        Err(err) if err.to_string().contains("stock_empty") => Ok(json!({
+            "ok": false,
+            "code": "stock_empty",
+            "error": "stock is empty; run selfiek produce to refill the stock inventory",
+            "source": "stock",
+            "generator": "selfiek",
+            "remaining": 0
+        })),
+        Err(err) => Err(err),
     }
 }
 
@@ -3082,9 +3336,11 @@ fn produce(cli: &Cli, use_templates: bool, quiet: bool, dry_run: bool) -> Result
         return Ok(json!({"ok": true, "skipped": "producer already running"}));
     }
     let stock = image_files(&cli.new_dir).len();
-    if stock >= 100 {
+    if stock >= cli.stock_limit {
         lock.unlock()?;
-        return Ok(json!({"ok": true, "skipped": "full", "stock": stock}));
+        return Ok(
+            json!({"ok": true, "skipped": "full", "stock": stock, "stock_limit": cli.stock_limit}),
+        );
     }
     let state_path = cli.runtime_dir.join(".selfiek.produce_state.json");
     let mut state: Value =
@@ -3103,7 +3359,7 @@ fn produce(cli: &Cli, use_templates: bool, quiet: bool, dry_run: bool) -> Result
     if dry_run {
         lock.unlock()?;
         return Ok(
-            json!({"ok": true, "dry_run": true, "would_generate": true, "stock": stock, "use_templates": use_templates}),
+            json!({"ok": true, "dry_run": true, "would_generate": true, "stock": stock, "stock_limit": cli.stock_limit, "use_templates": use_templates}),
         );
     }
     let result = generate(
@@ -3142,7 +3398,7 @@ fn produce(cli: &Cli, use_templates: bool, quiet: bool, dry_run: bool) -> Result
     write_json_atomic(&state_path, &state)?;
     lock.unlock()?;
     Ok(
-        json!({"ok": true, "image": result.get("image"), "metadata": result.get("metadata"), "stock": stock_after, "state": state, "generator":"selfiek"}),
+        json!({"ok": true, "image": result.get("image"), "metadata": result.get("metadata"), "stock": stock_after, "stock_limit": cli.stock_limit, "state": state, "generator":"selfiek"}),
     )
 }
 
@@ -3215,6 +3471,168 @@ mod tests {
         ).unwrap();
     }
 
+    fn test_cli(root: &Path) -> Cli {
+        Cli {
+            profile: "k-selfie".into(),
+            profile_file: None,
+            stock_limit: 100,
+            dice_config: root.join("dice.json"),
+            k_original: root.join("k"),
+            new_dir: root.join("new"),
+            used_dir: root.join("used"),
+            prompt_lib: root.join("prompt-lib"),
+            runtime_dir: root.join("runtime"),
+            cdper_bin: PathBuf::from("cdper-gpt-image"),
+            json: true,
+            command: Commands::Status,
+        }
+    }
+
+    fn write_profile_manifest(path: &Path) {
+        fs::write(
+            path,
+            "schema_version: selfiek.profile.v1\nid: demo-stock\ndisplay_name: Demo Stock\npaths:\n  dice_config: dice.json\n  reference_dir: refs\n  new_dir: stock/new\n  used_dir: stock/used\n  prompt_lib: prompt-lib\n  runtime_dir: runtime\n  cdper_bin: bin/cdper-gpt-image\nstock:\n  new_limit: 7\n",
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn profile_manifest_applies_relative_paths_and_stock_limit() {
+        let root = temp_path("profile-apply");
+        fs::create_dir_all(&root).unwrap();
+        let profile_file = root.join("profile.yml");
+        write_profile_manifest(&profile_file);
+        let mut cli = test_cli(&root);
+        cli.profile_file = Some(profile_file.clone());
+        let resolved = apply_profile_with_sources(cli, &OverrideSources::default()).unwrap();
+        assert_eq!(resolved.profile, "demo-stock");
+        assert_eq!(resolved.stock_limit, 7);
+        assert_eq!(resolved.dice_config, root.join("dice.json"));
+        assert_eq!(resolved.k_original, root.join("refs"));
+        assert_eq!(resolved.new_dir, root.join("stock/new"));
+        assert_eq!(resolved.used_dir, root.join("stock/used"));
+        assert_eq!(resolved.prompt_lib, root.join("prompt-lib"));
+        assert_eq!(resolved.runtime_dir, root.join("runtime"));
+        assert_eq!(resolved.cdper_bin, root.join("bin/cdper-gpt-image"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn profile_precedence_keeps_explicit_values_over_manifest() {
+        let root = temp_path("profile-precedence");
+        fs::create_dir_all(&root).unwrap();
+        let profile_file = root.join("profile.yml");
+        write_profile_manifest(&profile_file);
+        let mut cli = test_cli(&root);
+        cli.profile = "explicit-profile".into();
+        cli.profile_file = Some(profile_file);
+        cli.new_dir = root.join("explicit-new");
+        cli.stock_limit = 3;
+        let sources = OverrideSources {
+            profile: true,
+            new_dir: true,
+            stock_limit: true,
+            ..OverrideSources::default()
+        };
+        let resolved = apply_profile_with_sources(cli, &sources).unwrap();
+        assert_eq!(resolved.profile, "explicit-profile");
+        assert_eq!(resolved.new_dir, root.join("explicit-new"));
+        assert_eq!(resolved.stock_limit, 3);
+        assert_eq!(resolved.used_dir, root.join("stock/used"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn profile_manifest_rejects_invalid_schema_and_stock_limit() {
+        let bad_schema = ProfileManifest {
+            schema_version: Some("wrong".into()),
+            id: Some("demo".into()),
+            ..ProfileManifest::default()
+        };
+        assert!(validate_profile_manifest(&bad_schema).is_err());
+        let bad_limit = ProfileManifest {
+            schema_version: Some("selfiek.profile.v1".into()),
+            id: Some("demo".into()),
+            stock: Some(ProfileStock { new_limit: Some(0) }),
+            ..ProfileManifest::default()
+        };
+        assert!(validate_profile_manifest(&bad_limit).is_err());
+    }
+
+    #[test]
+    fn profile_validate_is_read_only_and_resolves_paths() {
+        let root = temp_path("profile-read-only");
+        fs::create_dir_all(&root).unwrap();
+        let profile_file = root.join("profile.yml");
+        write_profile_manifest(&profile_file);
+        let cli = test_cli(&root);
+        let out = profile_command(
+            &cli,
+            &ProfileCommands::Validate {
+                file: Some(profile_file.clone()),
+            },
+        )
+        .unwrap();
+        assert_eq!(out["ok"].as_bool(), Some(true));
+        assert_eq!(out["id"].as_str(), Some("demo-stock"));
+        assert_eq!(
+            out["paths"]["new_dir"].as_str(),
+            Some(root.join("stock/new").to_str().unwrap())
+        );
+        assert!(!root.join("stock/new").exists());
+        assert!(!root.join("runtime").exists());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn status_preserves_legacy_fields_and_adds_profile_stock() {
+        let root = temp_path("status-profile");
+        let mut cli = test_cli(&root);
+        cli.stock_limit = 9;
+        let out = status(&cli).unwrap();
+        assert_eq!(out["new_limit"].as_u64(), Some(9));
+        assert_eq!(out["stock"]["new_limit"].as_u64(), Some(9));
+        assert!(out["paths"].get("K-original").is_some());
+        assert!(out["paths"].get("reference_dir").is_some());
+        assert_eq!(out["profile"]["id"].as_str(), Some("k-selfie"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn produce_reports_resolved_stock_limit() {
+        let root = temp_path("produce-limit");
+        let mut cli = test_cli(&root);
+        cli.stock_limit = 1;
+        let dry = produce(&cli, false, true, true).unwrap();
+        assert_eq!(dry["stock_limit"].as_u64(), Some(1));
+        fs::create_dir_all(&cli.new_dir).unwrap();
+        fs::write(cli.new_dir.join("one.png"), b"fake").unwrap();
+        let full = produce(&cli, false, true, false).unwrap();
+        assert_eq!(full["skipped"].as_str(), Some("full"));
+        assert_eq!(full["stock_limit"].as_u64(), Some(1));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn next_stock_empty_does_not_generate() {
+        let root = temp_path("next-empty");
+        let mut cli = test_cli(&root);
+        cli.cdper_bin = root.join("missing-cdper");
+        let out = next(&cli, true).unwrap();
+        assert_eq!(out["ok"].as_bool(), Some(false));
+        assert_eq!(out["code"].as_str(), Some("stock_empty"));
+        assert!(image_files(&cli.new_dir).is_empty());
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn public_cli_rejects_generate_out_dir_and_instant_command() {
+        assert!(
+            Cli::try_parse_from(["selfiek-core", "generate", "--out-dir", "/tmp/escape"]).is_err()
+        );
+        assert!(Cli::try_parse_from(["selfiek-core", "instant", "--help"]).is_err());
+    }
+
     #[test]
     fn scans_v2_library_and_builds_prompt_card() {
         let root = temp_path("library");
@@ -3227,6 +3645,9 @@ mod tests {
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
+            profile: "k-selfie".into(),
+            profile_file: None,
+            stock_limit: 100,
             json: true,
             command: Commands::Status,
         };
@@ -3284,6 +3705,9 @@ mod tests {
             prompt_lib: root.join("prompt-lib"),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
+            profile: "k-selfie".into(),
+            profile_file: None,
+            stock_limit: 100,
             json: true,
             command: Commands::Status,
         };
@@ -3336,6 +3760,9 @@ mod tests {
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
+            profile: "k-selfie".into(),
+            profile_file: None,
+            stock_limit: 100,
             json: true,
             command: Commands::Status,
         };
@@ -3396,6 +3823,9 @@ mod tests {
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
+            profile: "k-selfie".into(),
+            profile_file: None,
+            stock_limit: 100,
             json: true,
             command: Commands::Status,
         };
@@ -3438,6 +3868,9 @@ mod tests {
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
+            profile: "k-selfie".into(),
+            profile_file: None,
+            stock_limit: 100,
             json: true,
             command: Commands::Status,
         };
@@ -3468,6 +3901,9 @@ mod tests {
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
+            profile: "k-selfie".into(),
+            profile_file: None,
+            stock_limit: 100,
             json: true,
             command: Commands::Status,
         };
@@ -3530,6 +3966,9 @@ mod tests {
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
+            profile: "k-selfie".into(),
+            profile_file: None,
+            stock_limit: 100,
             json: true,
             command: Commands::Status,
         };
@@ -3575,6 +4014,9 @@ mod tests {
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
+            profile: "k-selfie".into(),
+            profile_file: None,
+            stock_limit: 100,
             json: true,
             command: Commands::Status,
         };
@@ -3619,6 +4061,9 @@ mod tests {
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
+            profile: "k-selfie".into(),
+            profile_file: None,
+            stock_limit: 100,
             json: true,
             command: Commands::Status,
         };
@@ -3668,6 +4113,9 @@ mod tests {
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
+            profile: "k-selfie".into(),
+            profile_file: None,
+            stock_limit: 100,
             json: true,
             command: Commands::Status,
         };
@@ -3706,6 +4154,9 @@ mod tests {
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
+            profile: "k-selfie".into(),
+            profile_file: None,
+            stock_limit: 100,
             json: true,
             command: Commands::Status,
         };
@@ -3792,6 +4243,9 @@ mod tests {
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
+            profile: "k-selfie".into(),
+            profile_file: None,
+            stock_limit: 100,
             json: true,
             command: Commands::Status,
         };
@@ -3840,6 +4294,9 @@ mod tests {
             prompt_lib: root.clone(),
             runtime_dir: root.join("runtime"),
             cdper_bin: PathBuf::from("cdper-gpt-image"),
+            profile: "k-selfie".into(),
+            profile_file: None,
+            stock_limit: 100,
             json: true,
             command: Commands::Status,
         };
