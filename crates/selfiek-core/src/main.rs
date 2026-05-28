@@ -6,14 +6,14 @@ use image::{DynamicImage, GenericImage, ImageBuffer, Rgb, RgbImage};
 use rand::seq::SliceRandom;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
-const VERSION: &str = "3.6.1";
+const VERSION: &str = "3.6.2";
 const REF_IMAGE_PREFIX: &str = "请直接生成一张全新的写实摄影风格图片，不要回复文字，不要解释。参考拼图包含 3 张同一角色照片，仅作为面部特征和发型气质参考。请完全忽略参考图中的服装、姿势、背景、光线和拍摄角度。你需要生成一个全新的、独立的场景和构图，只保留图中人物的稳定面部特征（脸型、五官比例、肤质、发色）。";
 const NEGATIVE_SUFFIX: &str = "\n\n[Important constraints] Must avoid: deformed fingers, extra fingers, fused fingers, backwards fingers, mutated hands, poorly drawn hands, malformed limbs, extra arms, extra legs, fused legs, too many fingers, long neck, distorted face, asymmetric eyes, cross-eyed, cloned face, ugly, disfigured, blurry, low quality, pixelated, watermark, text overlay, over-processed, plastic skin, waxy appearance, uncanny valley, AI artifacts, unrealistic proportions, cartoon, anime, 3d render.";
 
@@ -142,6 +142,10 @@ enum Commands {
 enum LibraryCommands {
     Lint,
     Report,
+    Optimize {
+        #[arg(long)]
+        dry_run: bool,
+    },
     Ingest {
         #[arg(long)]
         source: PathBuf,
@@ -1443,6 +1447,8 @@ fn library_lint(cli: &Cli) -> Result<Value> {
         "errors": scan.errors,
         "warnings": scan.warnings,
         "quality_signals": scan.quality_signals,
+        "coverage": coverage_value(&scan, cli),
+        "inventory_quality": inventory_quality_value(cli),
         "legacy_needs_migration": scan.legacy_templates
     }))
 }
@@ -1484,6 +1490,41 @@ fn write_jsonl_atomic(path: &Path, rows: &[Value]) -> Result<()> {
     f.sync_all().ok();
     fs::rename(tmp, path)?;
     Ok(())
+}
+
+fn weight_delta(label: &str, positive: bool) -> i32 {
+    let magnitude = match label.to_ascii_lowercase().as_str() {
+        "high" => 4,
+        "medium" => 2,
+        "low" => 1,
+        _ => 1,
+    };
+    if positive {
+        magnitude
+    } else {
+        -magnitude
+    }
+}
+
+fn template_weight_entries(t: &TemplateEntry) -> Vec<Value> {
+    let mut out = Vec::new();
+    if let Some(label) = &t.positive_weight {
+        out.push(json!({
+            "kind":"positive_signal",
+            "template_id":t.id,
+            "weight":label,
+            "score_delta":weight_delta(label, true)
+        }));
+    }
+    if let Some(label) = &t.negative_weight {
+        out.push(json!({
+            "kind":"negative_signal",
+            "template_id":t.id,
+            "weight":label,
+            "score_delta":weight_delta(label, false)
+        }));
+    }
+    out
 }
 
 fn build_prompt_card_for_template(t: &TemplateEntry) -> Value {
@@ -1560,7 +1601,7 @@ fn build_prompt_card_for_template(t: &TemplateEntry) -> Value {
         "source_evidence":t.source_evidence,
         "k_image_ids":[],
         "taxonomy_ids":t.taxonomy_ids,
-        "weights_applied":[],
+        "weights_applied":template_weight_entries(t),
         "negative_rules":t
             .avoid
             .iter()
@@ -1592,6 +1633,155 @@ fn build_prompt_card_for_template(t: &TemplateEntry) -> Value {
     })
 }
 
+fn inventory_bucket_quality(dir: &Path) -> Value {
+    let images = image_files(dir);
+    let mut with_sidecar = 0usize;
+    let mut missing_sidecar = 0usize;
+    let mut missing_opening = 0usize;
+    let mut missing_prompt_card = 0usize;
+    for image in &images {
+        let sidecar = image.with_extension("json");
+        if !sidecar.exists() {
+            missing_sidecar += 1;
+            continue;
+        }
+        with_sidecar += 1;
+        match read_json_file::<Value>(&sidecar) {
+            Ok(j) => {
+                if j.get("opening")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .is_empty()
+                {
+                    missing_opening += 1;
+                }
+                if j.get("prompt_card").is_none() {
+                    missing_prompt_card += 1;
+                }
+            }
+            Err(_) => {
+                missing_opening += 1;
+                missing_prompt_card += 1;
+            }
+        }
+    }
+    json!({
+        "images":images.len(),
+        "with_sidecar":with_sidecar,
+        "missing_sidecar":missing_sidecar,
+        "missing_opening":missing_opening,
+        "missing_prompt_card":missing_prompt_card
+    })
+}
+
+fn inventory_quality_value(cli: &Cli) -> Value {
+    json!({
+        "schema":"selfiek.inventory_quality.v1",
+        "k_reference_images": image_files(&cli.k_original).len(),
+        "new": inventory_bucket_quality(&cli.new_dir),
+        "used": inventory_bucket_quality(&cli.used_dir)
+    })
+}
+
+fn coverage_value(scan: &LibraryScan, cli: &Cli) -> Value {
+    let prompt_templates: Vec<&TemplateEntry> = scan
+        .templates
+        .iter()
+        .filter(|t| t.template_type.as_deref().unwrap_or("prompt_template") == "prompt_template")
+        .collect();
+    let mut used_taxonomy = BTreeSet::new();
+    let mut scene_tags = BTreeSet::new();
+    let mut style_tags = BTreeSet::new();
+    let mut outfit_tags = BTreeSet::new();
+    let mut mood_tags = BTreeSet::new();
+    let mut positive_feedback = 0usize;
+    let mut negative_feedback = 0usize;
+    for t in &scan.templates {
+        for x in &t.taxonomy_ids {
+            used_taxonomy.insert(x.clone());
+        }
+        for x in &t.scene_tags {
+            scene_tags.insert(x.clone());
+        }
+        for x in &t.style_tags {
+            style_tags.insert(x.clone());
+        }
+        for x in &t.outfit_tags {
+            outfit_tags.insert(x.clone());
+        }
+        for x in &t.mood_tags {
+            mood_tags.insert(x.clone());
+        }
+        match t.template_type.as_deref() {
+            Some("positive_feedback") => positive_feedback += 1,
+            Some("negative_feedback") => negative_feedback += 1,
+            _ => {}
+        }
+    }
+    let declared_taxonomy: BTreeSet<String> = scan.taxonomy_ids.iter().cloned().collect();
+    let unused_taxonomy: Vec<String> = declared_taxonomy
+        .difference(&used_taxonomy)
+        .take(50)
+        .cloned()
+        .collect();
+    json!({
+        "schema":"selfiek.library_coverage.v1",
+        "prompt_card_ready_templates": prompt_templates.iter().filter(|t| !t.fragment_texts.is_empty()).count(),
+        "prompt_templates": prompt_templates.len(),
+        "feedback_templates": positive_feedback + negative_feedback,
+        "feedback": {"positive":positive_feedback,"negative":negative_feedback},
+        "axes": {
+            "scene_tags": scene_tags.len(),
+            "style_tags": style_tags.len(),
+            "outfit_tags": outfit_tags.len(),
+            "mood_tags": mood_tags.len()
+        },
+        "taxonomy": {
+            "declared": declared_taxonomy.len(),
+            "used": used_taxonomy.len(),
+            "unused_sample": unused_taxonomy
+        },
+        "inventory_summary": {
+            "k_reference_images": image_files(&cli.k_original).len(),
+            "new_images": image_files(&cli.new_dir).len(),
+            "used_images": image_files(&cli.used_dir).len()
+        }
+    })
+}
+
+fn build_weights_value(scan: &LibraryScan, generated_at: &str) -> Value {
+    let mut template_weights = Vec::new();
+    let mut tag_scores: BTreeMap<String, i32> = BTreeMap::new();
+    for t in &scan.templates {
+        for w in template_weight_entries(t) {
+            let delta = w.get("score_delta").and_then(|x| x.as_i64()).unwrap_or(0) as i32;
+            for tax in &t.taxonomy_ids {
+                *tag_scores.entry(tax.clone()).or_insert(0) += delta;
+            }
+            template_weights.push(w);
+        }
+    }
+    let tag_boosts: BTreeMap<String, i32> = tag_scores
+        .iter()
+        .filter(|(_, v)| **v > 0)
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    let tag_penalties: BTreeMap<String, i32> = tag_scores
+        .iter()
+        .filter(|(_, v)| **v < 0)
+        .map(|(k, v)| (k.clone(), *v))
+        .collect();
+    json!({
+        "schema":"selfiek.weights.v2",
+        "version":VERSION,
+        "generated_at":generated_at,
+        "template_weights":template_weights,
+        "tag_boosts":tag_boosts,
+        "tag_penalties":tag_penalties,
+        "runtime_policy":"deterministic_offline_weights_only_no_llm_hot_path"
+    })
+}
+
 fn library_report_value(cli: &Cli, use_orderk: bool) -> Result<Value> {
     let scan = library_scan(cli)?;
     Ok(json!({
@@ -1615,6 +1805,8 @@ fn library_report_value(cli: &Cli, use_orderk: bool) -> Result<Value> {
         "warnings": scan.warnings,
         "errors": scan.errors,
         "quality_signals": scan.quality_signals,
+        "coverage": coverage_value(&scan, cli),
+        "inventory_quality": inventory_quality_value(cli),
         "legacy_needs_migration": scan.legacy_templates
     }))
 }
@@ -1653,14 +1845,7 @@ fn compile_templates(cli: &Cli, out: Option<PathBuf>, use_orderk: bool) -> Resul
         .filter(|t| !t.fragment_texts.is_empty())
         .map(build_prompt_card_for_template)
         .collect();
-    let weights = json!({
-        "schema":"selfiek.weights.v1",
-        "version":VERSION,
-        "generated_at":generated_at,
-        "positive_templates": scan.templates.iter().filter(|t| t.positive_weight.is_some()).map(|t| t.id.clone()).collect::<Vec<_>>(),
-        "negative_templates": scan.templates.iter().filter(|t| t.negative_weight.is_some()).map(|t| t.id.clone()).collect::<Vec<_>>(),
-        "note":"v3.6 keeps runtime deterministic; feedback weights are metadata until a later scorer uses them"
-    });
+    let weights = build_weights_value(&scan, &generated_at);
     let template_out = out.unwrap_or_else(|| cli.runtime_dir.join("template_index.json"));
     let fragment_out = cli.runtime_dir.join("fragment_index.json");
     let cards_out = cli.runtime_dir.join("prompt_cards.jsonl");
@@ -1789,10 +1974,105 @@ fn library_ingest(cli: &Cli, source: &Path, dry_run: bool, apply: bool) -> Resul
     )
 }
 
+fn library_optimize(cli: &Cli, dry_run: bool) -> Result<Value> {
+    if !dry_run {
+        bail!("library optimize currently supports --dry-run only; no automatic prompt rewrites are applied");
+    }
+    let scan = library_scan(cli)?;
+    let coverage = coverage_value(&scan, cli);
+    let inventory_quality = inventory_quality_value(cli);
+    let mut actions = Vec::new();
+
+    for t in &scan.templates {
+        let entry_type = t.template_type.as_deref().unwrap_or("prompt_template");
+        if entry_type == "prompt_template" && t.fragment_texts.is_empty() {
+            actions.push(json!({
+                "code":"add_reusable_fragments",
+                "template_id":t.id,
+                "path":t.path,
+                "reason":"prompt template has no reusable fragments for prompt cards",
+                "suggestion":"add short Must Keep / Optional bullets instead of copying a full prompt"
+            }));
+        }
+        if entry_type == "prompt_template"
+            && (t.scene_tags.is_empty() || t.style_tags.is_empty() || t.outfit_tags.is_empty())
+        {
+            actions.push(json!({
+                "code":"expand_taxonomy_coverage",
+                "template_id":t.id,
+                "path":t.path,
+                "missing_axes":{
+                    "scene":t.scene_tags.is_empty(),
+                    "style":t.style_tags.is_empty(),
+                    "outfit":t.outfit_tags.is_empty()
+                },
+                "suggestion":"fill taxonomy scene/style/outfit ids so compiler can route templates deliberately"
+            }));
+        }
+        if t.raw_prompt_copy_risk {
+            actions.push(json!({
+                "code":"split_raw_prompt_copy",
+                "template_id":t.id,
+                "path":t.path,
+                "reason":"template copies raw prompt-like text into runtime fragments or avoid rules",
+                "suggestion":"split the source into smaller visible facts, camera, lighting, outfit, mood, and avoid fragments"
+            }));
+        }
+    }
+
+    for warning in &scan.warnings {
+        if warning.get("code").and_then(|x| x.as_str()) == Some("feedback_visible_fact_missing")
+            || warning.get("code").and_then(|x| x.as_str())
+                == Some("empty_quality_word_in_feedback")
+        {
+            actions.push(json!({
+                "code":"add_feedback_visible_facts",
+                "template_id":warning.get("id").cloned().unwrap_or(Value::Null),
+                "path":warning.get("path").cloned().unwrap_or(Value::Null),
+                "reason":"feedback needs concrete visual facts before it can safely affect weights",
+                "suggestion":"run vision inspection and record source.visual_note with scene/outfit/composition/light facts"
+            }));
+        }
+    }
+
+    if inventory_quality["new"]["missing_sidecar"]
+        .as_u64()
+        .unwrap_or(0)
+        > 0
+        || inventory_quality["used"]["missing_sidecar"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0
+    {
+        actions.push(json!({
+            "code":"repair_inventory_sidecars",
+            "reason":"some inventory images lack JSON sidecars, so opening/prompt_card attribution can be lost",
+            "suggestion":"quarantine or regenerate missing metadata; do not consume images without sidecar"
+        }));
+    }
+
+    Ok(json!({
+        "ok":scan.errors.is_empty(),
+        "schema":"selfiek.optimization_plan.v1",
+        "version":VERSION,
+        "generated_at":Utc::now().to_rfc3339(),
+        "dry_run":true,
+        "apply_supported":false,
+        "actions":actions,
+        "coverage":coverage,
+        "inventory_quality":inventory_quality,
+        "quality_signals":scan.quality_signals,
+        "errors":scan.errors,
+        "warnings":scan.warnings,
+        "policy":"offline_plan_only_no_llm_no_runtime_writes"
+    }))
+}
+
 fn library_command(cli: &Cli, command: &LibraryCommands) -> Result<Value> {
     match command {
         LibraryCommands::Lint => library_lint(cli),
         LibraryCommands::Report => library_report_value(cli, false),
+        LibraryCommands::Optimize { dry_run } => library_optimize(cli, *dry_run),
         LibraryCommands::Ingest {
             source,
             dry_run,
@@ -1835,11 +2115,11 @@ fn template_score(t: &TemplateEntry, scene: &Scene, style: &Style, outfit: &Outf
             score += 2;
         }
     }
-    if t.positive_weight.is_some() {
-        score += 2;
+    if let Some(label) = &t.positive_weight {
+        score += weight_delta(label, true);
     }
-    if t.negative_weight.is_some() {
-        score -= 3;
+    if let Some(label) = &t.negative_weight {
+        score += weight_delta(label, false);
     }
     score
 }
@@ -2607,6 +2887,150 @@ mod tests {
         let warning_codes = codes(&lint, "warnings");
         assert!(warning_codes.contains("feedback_visible_fact_missing"));
         assert!(warning_codes.contains("empty_quality_word_in_feedback"));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn compile_emits_actionable_feedback_weights_and_card_weights() {
+        let root = temp_path("feedback-weights");
+        write_fixture_library(&root);
+        fs::write(
+            root.join("templates/tpl-demo.md"),
+            "---\nschema_version: selfiek.template.v2\nid: tpl-demo\ntitle: 演唱会抓拍\nstatus: active\ntype: prompt_template\nsource:\n  raw_prompt_path: sources/src-demo.md\ntaxonomy:\n  scene_ids: [scene.concert]\n  style_ids: [style.candid_snapshot]\n  camera_ids: [camera.phone]\n  composition_ids: [composition.closeup]\n  outfit_ids: [outfit.casual]\n  mood_ids: [mood.energetic]\n  effect_ids: [effect.stage_light]\ncompiler:\n  use_mode: fragments\n  priority: high\npositive_signal:\n  weight: high\n---\n\n# 演唱会抓拍\n\n## Must Keep\n- 彩色舞台灯扫过脸侧\n- 人群背景里有荧光棒\n",
+        ).unwrap();
+        fs::write(
+            root.join("templates/negative-stagey.md"),
+            "---\nschema_version: selfiek.template.v2\nid: negative-stagey\ntitle: 负反馈：太棚拍\nstatus: active\ntype: negative_feedback\nsource:\n  source_image: /tmp/demo.png\n  source_metadata: /tmp/demo.json\n  visual_checked: true\n  visual_note: 背景像影棚布景，人物姿势僵硬，缺少真实人群和现场光\ntaxonomy:\n  scene_ids: [scene.concert]\nnegative_signal:\n  weight: high\n  avoid: [专业棚拍感]\n---\n\n# 负反馈\n",
+        ).unwrap();
+        let cli = Cli {
+            dice_config: root.join("dice.json"),
+            k_original: root.join("k"),
+            new_dir: root.join("new"),
+            used_dir: root.join("used"),
+            prompt_lib: root.clone(),
+            runtime_dir: root.join("runtime"),
+            cdper_bin: PathBuf::from("cdper-gpt-image"),
+            json: true,
+            command: Commands::Status,
+        };
+        let compiled = compile_templates(&cli, None, false).unwrap();
+        assert_eq!(compiled.get("ok").and_then(|x| x.as_bool()), Some(true));
+        let weights: Value = read_json_file(&root.join("runtime/weights.json")).unwrap();
+        assert_eq!(weights["schema"].as_str(), Some("selfiek.weights.v2"));
+        assert!(weights["template_weights"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| {
+                v.get("template_id").and_then(|x| x.as_str()) == Some("tpl-demo")
+                    && v.get("score_delta")
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or_default()
+                        > 0
+            }));
+        assert!(weights["template_weights"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| {
+                v.get("template_id").and_then(|x| x.as_str()) == Some("negative-stagey")
+                    && v.get("score_delta")
+                        .and_then(|x| x.as_i64())
+                        .unwrap_or_default()
+                        < 0
+            }));
+        let cards = fs::read_to_string(root.join("runtime/prompt_cards.jsonl")).unwrap();
+        let first_card: Value = serde_json::from_str(cards.lines().next().unwrap()).unwrap();
+        assert!(first_card["weights_applied"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| { v.get("kind").and_then(|x| x.as_str()) == Some("positive_signal") }));
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn library_report_contains_coverage_and_inventory_quality() {
+        let root = temp_path("coverage-report");
+        write_fixture_library(&root);
+        fs::create_dir_all(root.join("k")).unwrap();
+        fs::create_dir_all(root.join("new")).unwrap();
+        fs::create_dir_all(root.join("used")).unwrap();
+        fs::write(root.join("k/ref.png"), b"not-real-image").unwrap();
+        fs::write(root.join("new/stock.png"), b"not-real-image").unwrap();
+        fs::write(
+            root.join("new/stock.json"),
+            "{\"opening\":\"hi\",\"prompt_card\":{\"schema_version\":\"selfiek.prompt_card.v2\"}}",
+        )
+        .unwrap();
+        fs::write(root.join("used/old.png"), b"not-real-image").unwrap();
+        let cli = Cli {
+            dice_config: root.join("dice.json"),
+            k_original: root.join("k"),
+            new_dir: root.join("new"),
+            used_dir: root.join("used"),
+            prompt_lib: root.clone(),
+            runtime_dir: root.join("runtime"),
+            cdper_bin: PathBuf::from("cdper-gpt-image"),
+            json: true,
+            command: Commands::Status,
+        };
+        let report = library_report_value(&cli, false).unwrap();
+        assert_eq!(report.get("ok").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(
+            report["coverage"]["prompt_card_ready_templates"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(report["coverage"]["axes"]["scene_tags"].as_u64(), Some(1));
+        assert_eq!(
+            report["inventory_quality"]["k_reference_images"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            report["inventory_quality"]["new"]["images"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            report["inventory_quality"]["new"]["with_sidecar"].as_u64(),
+            Some(1)
+        );
+        assert_eq!(
+            report["inventory_quality"]["used"]["missing_sidecar"].as_u64(),
+            Some(1)
+        );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn library_optimize_dry_run_returns_plan_without_writing() {
+        let root = temp_path("optimize-plan");
+        write_fixture_library(&root);
+        fs::write(
+            root.join("templates/tpl-empty.md"),
+            "---\nschema_version: selfiek.template.v2\nid: tpl-empty\ntitle: 空模板\nstatus: active\ntype: prompt_template\nsource:\n  raw_prompt_path: sources/src-demo.md\ntaxonomy:\n  scene_ids: []\ncompiler:\n  use_mode: fragments\n---\n\n# 空模板\n",
+        ).unwrap();
+        let cli = Cli {
+            dice_config: root.join("dice.json"),
+            k_original: root.join("k"),
+            new_dir: root.join("new"),
+            used_dir: root.join("used"),
+            prompt_lib: root.clone(),
+            runtime_dir: root.join("runtime"),
+            cdper_bin: PathBuf::from("cdper-gpt-image"),
+            json: true,
+            command: Commands::Status,
+        };
+        let plan = library_optimize(&cli, true).unwrap();
+        assert_eq!(plan.get("ok").and_then(|x| x.as_bool()), Some(true));
+        assert_eq!(plan.get("dry_run").and_then(|x| x.as_bool()), Some(true));
+        let actions = plan["actions"].as_array().unwrap();
+        assert!(actions
+            .iter()
+            .any(|v| v.get("code").and_then(|x| x.as_str()) == Some("add_reusable_fragments")));
+        assert!(actions
+            .iter()
+            .any(|v| v.get("code").and_then(|x| x.as_str()) == Some("expand_taxonomy_coverage")));
+        assert!(!root.join("runtime/optimization_plan.json").exists());
         fs::remove_dir_all(root).ok();
     }
 

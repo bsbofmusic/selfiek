@@ -32,6 +32,7 @@ selfiek status --json
 selfiek validate-config --json
 selfiek library lint --json
 selfiek library report --json
+selfiek library optimize --dry-run --json
 selfiek compile --json
 selfiek compile --use-orderk --json
 selfiek draw --json --use-templates --explain
@@ -44,9 +45,9 @@ selfiek cleanup-used --json
 
 ## Version model
 
-- `runtime_version`: 3.6.1
-- `contract_version`: 3.6.1
+- `runtime_version`: 3.6.2
+- `contract_version`: 3.6.2
 
-SelfieK 3.6 upgrades prompt-library absorption: `library lint` validates the Obsidian recipe book, `library ingest` creates source/template drafts, `compile` emits `template_index.json`, `fragment_index.json`, `prompt_cards.jsonl`, `library_report.json`, and `weights.json`, and `draw/generate --use-templates` attach `prompt_card` v2 for feedback attribution. orderk is compile/report-only; production cron still consumes compiled artifacts and cdper remains the image-generation adapter.
+SelfieK 3.6 upgrades prompt-library absorption: `library lint` validates the Obsidian recipe book, `library ingest` creates source/template drafts, `library optimize --dry-run` produces an offline no-write cleanup plan, `library report` includes coverage and inventory-quality sections, `compile` emits `template_index.json`, `fragment_index.json`, `prompt_cards.jsonl`, `library_report.json`, and actionable `weights.json` v2, and `draw/generate --use-templates` attach `prompt_card` v2 for feedback attribution. orderk is compile/report-only; production cron still consumes compiled artifacts and cdper remains the image-generation adapter.
 
 The prompt-library layer also includes lightweight guardrails borrowed from prompt-optimizer-style tooling without adopting its product shape: raw prompts are stored as JSON evidence references instead of copied wholesale, risky role/injection-like source text is reported by `library lint`, `{{placeholder}}` variables are tracked through prompt cards, structured JSON sources expose top-level key preservation warnings, feedback templates are nudged toward visible facts, and `library report` emits machine-readable `quality_signals`. There is still no LLM prompt optimizer, UI, daemon, MCP optimize tool, or cdper rewrite step.

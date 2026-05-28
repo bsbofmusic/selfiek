@@ -8,6 +8,7 @@ selfiek status --json
 selfiek validate-config --json
 selfiek library lint --json
 selfiek library report --json
+selfiek library optimize --dry-run --json
 selfiek compile --json
 selfiek compile --use-orderk --json
 selfiek draw --json --use-templates --explain
@@ -22,4 +23,4 @@ The package bundles a Linux x64 Rust core binary. On other platforms set `SELFIE
 
 SelfieK reuses `cdper-gpt-image` for actual ChatGPT/CDP image generation.
 
-Prompt-library guardrails are intentionally lightweight: `library lint/report` can surface prompt-injection-like raw source text, raw-copy risk, placeholder preservation state, structured JSON key preservation hints, and feedback visible-fact warnings. The package does not include an LLM prompt optimizer, UI, daemon, MCP optimize tool, or image-generation backend.
+Prompt-library guardrails are intentionally lightweight: `library lint/report` can surface prompt-injection-like raw source text, raw-copy risk, placeholder preservation state, structured JSON key preservation hints, feedback visible-fact warnings, coverage gaps, and inventory sidecar quality. `library optimize --dry-run` returns an offline no-write plan; it does not rewrite prompts automatically. The package does not include an LLM prompt optimizer, UI, daemon, MCP optimize tool, or image-generation backend.
