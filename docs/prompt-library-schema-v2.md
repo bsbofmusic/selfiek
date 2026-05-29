@@ -8,6 +8,11 @@ SelfieK 3.6 treats the Obsidian prompt library as the canonical recipe book and 
 raw/selfie-prompts/
   README.md
   inbox/
+    external-prompts/
+      watchlist/
+      sources/
+      candidates/
+      rejected/
   sources/
   templates/
   fragments/
@@ -105,6 +110,30 @@ A concise human summary.
 - Failure modes or overfitting risks.
 ```
 
+## Harvest candidate note
+
+`selfiek library harvest --source <path> --dry-run|--apply` ingests local watchlist/search-export notes into `inbox/external-prompts/`. Accepted items get immutable source notes under `inbox/external-prompts/sources/` plus candidate notes under `inbox/external-prompts/candidates/`; low-scoring/high-risk items go to `inbox/external-prompts/rejected/` for dedupe evidence. These notes are **not** scanned as active templates and never reach runtime generation until a human promotes them into `templates/` and reruns lint/compile.
+
+```markdown
+---
+schema_version: selfiek.harvest_candidate.v1
+id: cand-fisheye-vaporwave-subway-1234abcd
+status: triaged
+type: prompt_template_candidate
+source:
+  source_url: https://example.invalid/reference
+  source_type: watchlist_seed
+candidate_status: triaged
+quality_dimensions: [camera_authenticity, background_realism, skin_texture]
+style_tags: [fisheye, vaporwave, candid_snapshot]
+fun_axes: [novelty, persona_fit, remixability]
+quality_score: 4.2
+fun_score: 4.1
+risk_score: 0.8
+policy: candidate_only_no_generation_no_runtime_weight_write
+---
+```
+
 ## Fragment note
 
 Reusable atoms can live as YAML or Markdown frontmatter:
@@ -127,6 +156,8 @@ avoid_with: [style.clean_digital, style.fashion_editorial]
 selfiek library lint --json
 selfiek library ingest --source <path-or-dir> --dry-run --json
 selfiek library ingest --source <path-or-dir> --apply --json
+selfiek library harvest --source <watchlist-or-search-export> --dry-run --json
+selfiek library harvest --source <watchlist-or-search-export> --apply --json
 selfiek library report --json
 selfiek compile --use-orderk --json
 selfiek draw --use-templates --explain --json

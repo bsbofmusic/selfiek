@@ -17,6 +17,9 @@ for (const rel of [
   'prompt-lib/templates',
   'prompt-lib/fragments/effect',
   'prompt-lib/rules',
+  'prompt-lib/inbox/external-prompts/watchlist',
+  'prompt-lib/inbox/external-prompts/candidates',
+  'prompt-lib/inbox/external-prompts/rejected',
 ]) mkdirSync(join(root, rel), { recursive: true });
 
 const tinyJpeg = Buffer.from(
@@ -62,6 +65,11 @@ writeFileSync(join(dirs.promptLib, 'rules/safety.yaml'), `schema_version: selfie
 writeFileSync(
   join(dirs.promptLib, 'templates/tpl-demo.md'),
   `---\nschema_version: selfiek.template.v2\nid: tpl-demo\ntitle: 演唱会抓拍\nstatus: active\ntype: prompt_template\nsource:\n  raw_prompt_path: sources/src-demo.md\ntaxonomy:\n  scene_ids: [scene.concert]\n  style_ids: [style.candid_snapshot]\n  camera_ids: [camera.phone]\n  composition_ids: [composition.closeup]\n  outfit_ids: [outfit.casual]\n  mood_ids: [mood.energetic]\n  effect_ids: [effect.stage_light]\ncompiler:\n  use_mode: fragments\n  priority: high\n---\n\n# 演唱会抓拍\n\n## Must Keep\n- 彩色舞台灯扫过脸侧\n- 人群背景里有荧光棒\n\n## Avoid\n- 专业棚拍感\n`,
+);
+
+writeFileSync(
+  join(dirs.promptLib, 'inbox/external-prompts/watchlist/fisheye-vaporwave.md'),
+  `---\ntitle: 鱼眼蒸汽波地铁自拍模板\nsource_url: https://example.invalid/selfiek/fisheye-vaporwave\nsource_type: watchlist_seed\nclaimed_value: 鱼眼近景、蒸汽波霓虹、地铁反光材质组合，适合人物图模板库持续吸收。\nquality_dimensions: [camera_authenticity, background_realism, skin_texture]\nstyle_tags: [fisheye, vaporwave, candid_snapshot]\nfun_axes: [novelty, persona_fit, remixability]\nquality_score: 4.2\nfun_score: 4.1\nrisk_score: 0.8\n---\n\n## Raw Excerpt\n用 18mm 鱼眼手机前摄自拍，地铁玻璃反射紫粉霓虹，皮肤有真实颗粒和轻微运动模糊，背景有站台广告牌和人流。\n`,
 );
 
 console.log(JSON.stringify(dirs, null, 2));

@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use walkdir::WalkDir;
 
-const VERSION: &str = "3.9.0";
+const VERSION: &str = "3.10.0";
 const REF_IMAGE_PREFIX: &str = "请直接生成一张全新的写实摄影风格图片，不要回复文字，不要解释。参考拼图包含 3 张同一角色照片，仅作为面部特征和发型气质参考。请完全忽略参考图中的服装、姿势、背景、光线和拍摄角度。你需要生成一个全新的、独立的场景和构图，只保留图中人物的稳定面部特征（脸型、五官比例、肤质、发色）。";
 const NEGATIVE_SUFFIX: &str = "\n\n[Important constraints] Must avoid: deformed fingers, extra fingers, fused fingers, backwards fingers, mutated hands, poorly drawn hands, malformed limbs, extra arms, extra legs, fused legs, too many fingers, long neck, distorted face, asymmetric eyes, cross-eyed, cloned face, ugly, disfigured, blurry, low quality, pixelated, watermark, text overlay, over-processed, plastic skin, waxy appearance, uncanny valley, AI artifacts, unrealistic proportions, cartoon, anime, 3d render.";
 
@@ -190,6 +190,20 @@ enum LibraryCommands {
         #[arg(long)]
         apply: bool,
     },
+    Harvest {
+        #[arg(long)]
+        source: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+        #[arg(long)]
+        apply: bool,
+        #[arg(long, default_value_t = 20)]
+        limit: usize,
+        #[arg(long, default_value_t = 3.0)]
+        min_quality: f64,
+        #[arg(long, default_value_t = 2.0)]
+        min_fun: f64,
+    },
 }
 
 #[derive(Subcommand, Debug)]
@@ -270,6 +284,20 @@ struct TemplateEntry {
     outfit_tags: Vec<String>,
     #[serde(default)]
     mood_tags: Vec<String>,
+    #[serde(default)]
+    quality_dimensions: Vec<String>,
+    #[serde(default)]
+    fun_axes: Vec<String>,
+    #[serde(default)]
+    quality_score: Option<f64>,
+    #[serde(default)]
+    fun_score: Option<f64>,
+    #[serde(default)]
+    risk_score: Option<f64>,
+    #[serde(default)]
+    candidate_status: Option<String>,
+    #[serde(default)]
+    source_type: Option<String>,
     #[serde(default)]
     taxonomy_ids: Vec<String>,
     #[serde(default)]
@@ -362,6 +390,8 @@ struct LibraryScan {
     feedback_count: usize,
     rule_count: usize,
     image_file_count: usize,
+    harvest_inbox_count: usize,
+    harvest_candidate_count: usize,
     sources: Vec<SourceEntry>,
     templates: Vec<TemplateEntry>,
     fragments: Vec<FragmentEntry>,
@@ -370,6 +400,25 @@ struct LibraryScan {
     warnings: Vec<Value>,
     legacy_templates: Vec<Value>,
     quality_signals: QualitySignals,
+}
+
+#[derive(Debug, Clone)]
+struct HarvestCandidate {
+    id_seed: String,
+    title: String,
+    source_url: String,
+    source_type: String,
+    raw_excerpt: String,
+    claimed_value: String,
+    quality_dimensions: Vec<String>,
+    style_tags: Vec<String>,
+    fun_axes: Vec<String>,
+    quality_score: f64,
+    fun_score: f64,
+    risk_score: f64,
+    risk_notes: Vec<String>,
+    accepted: bool,
+    reject_reasons: Vec<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -979,6 +1028,28 @@ fn opt_str_at(v: &Value, keys: &[&str]) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn opt_f64_at(v: &Value, keys: &[&str]) -> Option<f64> {
+    get_path_value(v, keys).and_then(|x| {
+        x.as_f64()
+            .or_else(|| x.as_str().and_then(|s| s.trim().parse::<f64>().ok()))
+            .filter(|score| score.is_finite())
+    })
+}
+
+fn short_hash(s: &str) -> String {
+    format!("{:x}", md5::compute(s.as_bytes()))
+        .chars()
+        .take(8)
+        .collect()
+}
+
+fn clamp_score(x: f64) -> f64 {
+    if !x.is_finite() {
+        return 5.0;
+    }
+    (x * 10.0).round().clamp(0.0, 50.0) / 10.0
+}
+
 fn dedupe_strings(xs: Vec<String>) -> Vec<String> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
@@ -1106,6 +1177,15 @@ fn template_entry_from_document(path: &Path, j: &Value, body: &str) -> TemplateE
             xs.extend(nested_str_list(j, &["taxonomy", "mood_ids"]));
             xs
         }),
+        quality_dimensions: dedupe_strings(str_list(j, "quality_dimensions")),
+        fun_axes: dedupe_strings(str_list(j, "fun_axes")),
+        quality_score: opt_f64_at(j, &["quality_score"]),
+        fun_score: opt_f64_at(j, &["fun_score"]),
+        risk_score: opt_f64_at(j, &["risk_score"]),
+        candidate_status: opt_str_at(j, &["candidate_status"])
+            .or_else(|| opt_str_at(j, &["status"])),
+        source_type: opt_str_at(j, &["source", "source_type"])
+            .or_else(|| opt_str_at(j, &["source_type"])),
         taxonomy_ids: collect_taxonomy_ids(j),
         source_ids: dedupe_strings(source_ids),
         fragment_ids: vec![],
@@ -1570,6 +1650,9 @@ fn library_scan(cli: &Cli) -> Result<LibraryScan> {
         feedback_count: note_files(&root.join("feedback"), true).len(),
         rule_count: note_files(&root.join("rules"), true).len(),
         image_file_count: image_files(root).len(),
+        harvest_inbox_count: note_files(&root.join("inbox/external-prompts"), true).len(),
+        harvest_candidate_count: note_files(&root.join("inbox/external-prompts/candidates"), true)
+            .len(),
         sources: vec![],
         templates: vec![],
         fragments: vec![],
@@ -1747,7 +1830,9 @@ fn library_lint(cli: &Cli) -> Result<Value> {
             "fragment_files": scan.fragment_file_count,
             "compiled_fragments": scan.fragments.len(),
             "feedback": scan.feedback_count,
-            "rules": scan.rule_count
+            "rules": scan.rule_count,
+            "harvest_inbox": scan.harvest_inbox_count,
+            "harvest_candidates": scan.harvest_candidate_count
         },
         "errors": scan.errors,
         "warnings": scan.warnings,
@@ -2380,6 +2465,15 @@ fn build_prompt_card_for_template(t: &TemplateEntry) -> Value {
         "fragment_ids":fragment_ids,
         "source_ids":t.source_ids,
         "source_evidence":t.source_evidence,
+        "quality_dimensions":t.quality_dimensions,
+        "fun_axes":t.fun_axes,
+        "scores":{
+            "quality":t.quality_score,
+            "fun":t.fun_score,
+            "risk":t.risk_score
+        },
+        "candidate_status":t.candidate_status,
+        "source_type":t.source_type,
         "k_image_ids":[],
         "taxonomy_ids":t.taxonomy_ids,
         "weights_applied":template_weight_entries(t),
@@ -2597,7 +2691,9 @@ fn library_report_value(cli: &Cli, use_orderk: bool) -> Result<Value> {
             "fragments": scan.fragments.len(),
             "fragment_files": scan.fragment_file_count,
             "feedback": scan.feedback_count,
-            "rules": scan.rule_count
+            "rules": scan.rule_count,
+            "harvest_inbox": scan.harvest_inbox_count,
+            "harvest_candidates": scan.harvest_candidate_count
         },
         "warnings": scan.warnings,
         "errors": scan.errors,
@@ -2703,6 +2799,24 @@ fn ingest_inputs(source: &Path) -> Vec<PathBuf> {
     note_files(source, true)
 }
 
+fn is_harvest_generated_path(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    [
+        "inbox/external-prompts/sources/",
+        "inbox/external-prompts/candidates/",
+        "inbox/external-prompts/rejected/",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
+}
+
+fn harvest_inputs(source: &Path) -> Vec<PathBuf> {
+    ingest_inputs(source)
+        .into_iter()
+        .filter(|path| !is_harvest_generated_path(path))
+        .collect()
+}
+
 fn library_ingest(cli: &Cli, source: &Path, dry_run: bool, apply: bool) -> Result<Value> {
     if dry_run == apply {
         bail!("choose exactly one of --dry-run or --apply");
@@ -2770,6 +2884,534 @@ fn library_ingest(cli: &Cli, source: &Path, dry_run: bool, apply: bool) -> Resul
     Ok(
         json!({"ok":true,"dry_run":dry_run,"applied":apply,"source":source,"count":actions.len(),"actions":actions}),
     )
+}
+
+fn harvest_compact_slug(s: &str, max_chars: usize) -> String {
+    let mut slug: String = sanitize_slug(s).chars().take(max_chars).collect();
+    slug = slug.trim_matches('-').to_string();
+    if slug.is_empty() {
+        "prompt".into()
+    } else {
+        slug
+    }
+}
+
+fn first_opt_str(j: &Value, paths: &[&[&str]]) -> Option<String> {
+    for keys in paths {
+        if let Some(value) = opt_str_at(j, keys) {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn compact_text_excerpt(s: &str, max_chars: usize) -> String {
+    let compact = s
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && *line != "---")
+        .collect::<Vec<_>>()
+        .join(" ");
+    compact.chars().take(max_chars).collect::<String>()
+}
+
+fn contains_any(text: &str, terms: &[&str]) -> bool {
+    let lowered = text.to_ascii_lowercase();
+    terms.iter().any(|term| lowered.contains(term))
+}
+
+fn infer_quality_dimensions(text: &str) -> Vec<String> {
+    let mut dims = Vec::new();
+    if contains_any(
+        text,
+        &["camera", "lens", "focal", "selfie", "鱼眼", "镜头", "自拍"],
+    ) {
+        dims.push("camera_authenticity".to_string());
+    }
+    if contains_any(
+        text,
+        &[
+            "background",
+            "texture",
+            "clutter",
+            "street",
+            "背景",
+            "材质",
+            "街拍",
+        ],
+    ) {
+        dims.push("background_realism".to_string());
+    }
+    if contains_any(
+        text,
+        &["skin", "grain", "realistic", "film", "胶片", "皮肤", "颗粒"],
+    ) {
+        dims.push("skin_texture".to_string());
+    }
+    if contains_any(
+        text,
+        &["hand", "anatomy", "pose", "body", "手", "姿势", "肢体"],
+    ) {
+        dims.push("anatomy_hands".to_string());
+    }
+    if dims.is_empty() {
+        dims.push("anti_ai_polish".to_string());
+    }
+    dedupe_strings(dims)
+}
+
+fn infer_style_tags(text: &str) -> Vec<String> {
+    let mut tags = Vec::new();
+    for (tag, terms) in [
+        ("fisheye", &["fisheye", "鱼眼"][..]),
+        ("vaporwave", &["vaporwave", "蒸汽波"][..]),
+        (
+            "retro_selfie",
+            &["retro", "ccd", "y2k", "年代感", "复古"][..],
+        ),
+        ("cosplay", &["cosplay", "cos", "角色扮演"][..]),
+        (
+            "movie_poster",
+            &["movie poster", "poster", "电影海报", "海报"][..],
+        ),
+        ("magazine_cover", &["magazine", "cover", "杂志", "封面"][..]),
+        (
+            "candid_snapshot",
+            &["candid", "snapshot", "抓拍", "偷拍"][..],
+        ),
+        ("street_photo", &["street", "街拍", "路人"][..]),
+    ] {
+        if contains_any(text, terms) {
+            tags.push(tag.to_string());
+        }
+    }
+    if tags.is_empty() {
+        tags.push("prompt_reference".to_string());
+    }
+    dedupe_strings(tags)
+}
+
+fn infer_fun_axes(text: &str) -> Vec<String> {
+    let mut axes = Vec::new();
+    if contains_any(
+        text,
+        &[
+            "fisheye",
+            "vaporwave",
+            "cos",
+            "poster",
+            "鱼眼",
+            "蒸汽波",
+            "海报",
+        ],
+    ) {
+        axes.push("novelty".to_string());
+    }
+    if contains_any(
+        text,
+        &["story", "scene", "cinematic", "故事", "电影", "场景"],
+    ) {
+        axes.push("story".to_string());
+    }
+    if contains_any(
+        text,
+        &["remix", "style", "template", "玩法", "风格", "混搭"],
+    ) {
+        axes.push("remixability".to_string());
+    }
+    if contains_any(
+        text,
+        &["portrait", "selfie", "person", "人物", "人像", "自拍"],
+    ) {
+        axes.push("persona_fit".to_string());
+    }
+    if axes.is_empty() {
+        axes.push("reusable_reference".to_string());
+    }
+    dedupe_strings(axes)
+}
+
+fn heuristic_quality_score(text: &str, quality_dimensions: &[String]) -> f64 {
+    let mut score = 2.4 + (quality_dimensions.len() as f64 * 0.28).min(1.4);
+    for terms in [
+        &["lens", "focal", "camera", "镜头", "焦段"][..],
+        &["texture", "grain", "skin", "材质", "颗粒", "皮肤"][..],
+        &["lighting", "shadow", "光线", "阴影"][..],
+        &["background", "clutter", "背景", "杂物"][..],
+    ] {
+        if contains_any(text, terms) {
+            score += 0.25;
+        }
+    }
+    if text.chars().count() < 40 {
+        score -= 0.6;
+    }
+    clamp_score(score)
+}
+
+fn heuristic_fun_score(text: &str, style_tags: &[String], fun_axes: &[String]) -> f64 {
+    let mut score =
+        2.0 + (style_tags.len() as f64 * 0.25).min(1.0) + (fun_axes.len() as f64 * 0.25).min(1.0);
+    if contains_any(
+        text,
+        &[
+            "fisheye",
+            "vaporwave",
+            "cos",
+            "poster",
+            "y2k",
+            "鱼眼",
+            "蒸汽波",
+            "海报",
+            "年代感",
+        ],
+    ) {
+        score += 0.7;
+    }
+    clamp_score(score)
+}
+
+fn heuristic_risk_score(text: &str) -> (f64, Vec<String>) {
+    let mut score = 0.8;
+    let mut notes = Vec::new();
+    if contains_any(text, &["nude", "nsfw", "sexy", "裸", "色情", "性感"]) {
+        score += 2.5;
+        notes.push("sexualized_or_boundary_sensitive_terms".to_string());
+    }
+    if contains_any(text, &["child", "teen", "underage", "未成年", "少女"]) {
+        score += 2.0;
+        notes.push("age_sensitive_terms".to_string());
+    }
+    if contains_any(
+        text,
+        &["celebrity", "famous", "明星", "名人", "换脸", "face swap"],
+    ) {
+        score += 1.1;
+        notes.push("identity_or_ip_sensitive_terms".to_string());
+    }
+    if notes.is_empty() {
+        notes.push("low_known_risk".to_string());
+    }
+    (clamp_score(score), notes)
+}
+
+fn harvest_candidate_from_file(
+    path: &Path,
+    min_quality: f64,
+    min_fun: f64,
+) -> Result<HarvestCandidate> {
+    let raw = fs::read_to_string(path)
+        .with_context(|| format!("read harvest source {}", path.display()))?;
+    let (j, body) =
+        parse_template_document(&raw, path).unwrap_or_else(|_| (json!({}), raw.clone()));
+    let material = if body.trim().is_empty() { &raw } else { &body };
+    let title =
+        first_opt_str(&j, &[&["title"], &["name"], &["source", "title"]]).unwrap_or_else(|| {
+            path.file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("prompt reference")
+                .to_string()
+        });
+    let source_url = first_opt_str(
+        &j,
+        &[
+            &["source_url"],
+            &["url"],
+            &["source", "url"],
+            &["source", "source_url"],
+        ],
+    )
+    .unwrap_or_else(|| path.to_string_lossy().to_string());
+    let source_type = first_opt_str(&j, &[&["source_type"], &["source", "source_type"]])
+        .unwrap_or_else(|| "local_prompt_reference".to_string());
+    let raw_excerpt = first_opt_str(
+        &j,
+        &[&["raw_excerpt"], &["raw_prompt"], &["prompt"], &["excerpt"]],
+    )
+    .unwrap_or_else(|| compact_text_excerpt(material, 900));
+    let claimed_value = first_opt_str(
+        &j,
+        &[
+            &["claimed_value"],
+            &["summary"],
+            &["description"],
+            &["lesson", "user_pain"],
+        ],
+    )
+    .unwrap_or_else(|| "external prompt reference for offline SelfieK triage".to_string());
+    let hay = format!("{} {} {}", title, claimed_value, raw_excerpt);
+    let mut quality_dimensions = dedupe_strings(str_list(&j, "quality_dimensions"));
+    if quality_dimensions.is_empty() {
+        quality_dimensions = infer_quality_dimensions(&hay);
+    }
+    let mut style_tags = dedupe_strings(str_list(&j, "style_tags"));
+    if style_tags.is_empty() {
+        style_tags = infer_style_tags(&hay);
+    }
+    let mut fun_axes = dedupe_strings(str_list(&j, "fun_axes"));
+    if fun_axes.is_empty() {
+        fun_axes = infer_fun_axes(&hay);
+    }
+    let quality_score = opt_f64_at(&j, &["quality_score"])
+        .or_else(|| opt_f64_at(&j, &["scores", "quality"]))
+        .map(clamp_score)
+        .unwrap_or_else(|| heuristic_quality_score(&hay, &quality_dimensions));
+    let fun_score = opt_f64_at(&j, &["fun_score"])
+        .or_else(|| opt_f64_at(&j, &["scores", "fun"]))
+        .map(clamp_score)
+        .unwrap_or_else(|| heuristic_fun_score(&hay, &style_tags, &fun_axes));
+    let (heuristic_risk, heuristic_notes) = heuristic_risk_score(&hay);
+    let imported_risk = opt_f64_at(&j, &["risk_score"])
+        .or_else(|| opt_f64_at(&j, &["scores", "risk"]))
+        .map(clamp_score);
+    let risk_score = imported_risk
+        .map(|score| score.max(heuristic_risk))
+        .unwrap_or(heuristic_risk);
+    let mut risk_notes = str_list(&j, "risk_notes");
+    risk_notes.extend(heuristic_notes);
+    risk_notes = dedupe_strings(risk_notes);
+    let mut reject_reasons = Vec::new();
+    if quality_score < min_quality {
+        reject_reasons.push(format!("quality_score_below_{min_quality:.1}"));
+    }
+    if fun_score < min_fun {
+        reject_reasons.push(format!("fun_score_below_{min_fun:.1}"));
+    }
+    if risk_score >= 4.0 {
+        reject_reasons.push("risk_score_too_high".to_string());
+    }
+    if raw_excerpt.chars().count() < 20 {
+        reject_reasons.push("raw_excerpt_too_short".to_string());
+    }
+    let id_seed = format!(
+        "cand-{}-{}",
+        harvest_compact_slug(&title, 48),
+        short_hash(&format!("{}\n{}", source_url, raw_excerpt))
+    );
+    Ok(HarvestCandidate {
+        id_seed,
+        title,
+        source_url,
+        source_type,
+        raw_excerpt,
+        claimed_value,
+        quality_dimensions,
+        style_tags,
+        fun_axes,
+        quality_score,
+        fun_score,
+        risk_score,
+        risk_notes,
+        accepted: reject_reasons.is_empty(),
+        reject_reasons,
+    })
+}
+
+fn harvest_candidate_value(candidate: &HarvestCandidate) -> Value {
+    json!({
+        "id": candidate.id_seed,
+        "title": candidate.title,
+        "source_url": candidate.source_url,
+        "source_type": candidate.source_type,
+        "quality_dimensions": candidate.quality_dimensions,
+        "style_tags": candidate.style_tags,
+        "fun_axes": candidate.fun_axes,
+        "quality_score": candidate.quality_score,
+        "fun_score": candidate.fun_score,
+        "risk_score": candidate.risk_score,
+        "risk_notes": candidate.risk_notes,
+        "accepted": candidate.accepted,
+        "reject_reasons": candidate.reject_reasons,
+    })
+}
+
+fn harvest_source_note(candidate: &HarvestCandidate, created_at: &str) -> String {
+    format!(
+        "---\nschema_version: selfiek.harvest_source.v1\nid: src-{}\nstatus: inbox\ntype: external_prompt_source\ncreated_at: \"{}\"\nsource_url: \"{}\"\nsource_type: \"{}\"\nlicense_scope: review_before_reuse\n---\n\n# {}\n\n## Claimed Value\n{}\n\n## Raw Excerpt\n{}\n",
+        short_hash(&candidate.id_seed),
+        created_at,
+        candidate.source_url.replace('"', "'"),
+        candidate.source_type.replace('"', "'"),
+        candidate.title,
+        candidate.claimed_value,
+        candidate.raw_excerpt
+    )
+}
+
+fn harvest_candidate_note(
+    candidate: &HarvestCandidate,
+    created_at: &str,
+    source_rel: Option<&str>,
+) -> Result<String> {
+    let status = if candidate.accepted {
+        "triaged"
+    } else {
+        "rejected"
+    };
+    let fm = json!({
+        "schema_version":"selfiek.harvest_candidate.v1",
+        "id":candidate.id_seed,
+        "title":candidate.title,
+        "status":status,
+        "type":"prompt_template_candidate",
+        "created_at":created_at,
+        "source":{
+            "source_url":candidate.source_url,
+            "source_type":candidate.source_type,
+            "raw_material_path":source_rel,
+            "raw_excerpt_md5":format!("{:x}", md5::compute(candidate.raw_excerpt.as_bytes()))
+        },
+        "candidate_status":status,
+        "quality_dimensions":candidate.quality_dimensions,
+        "style_tags":candidate.style_tags,
+        "fun_axes":candidate.fun_axes,
+        "quality_score":candidate.quality_score,
+        "fun_score":candidate.fun_score,
+        "risk_score":candidate.risk_score,
+        "risk_notes":candidate.risk_notes,
+        "accepted_by_harvest":candidate.accepted,
+        "reject_reasons":candidate.reject_reasons,
+        "policy":"candidate_only_no_generation_no_runtime_weight_write"
+    });
+    Ok(format!(
+        "---\n{}---\n\n# {}\n\n## Claimed Value\n{}\n\n## Reusable Atoms\n- Quality dimensions: {}\n- Style tags: {}\n- Fun axes: {}\n\n## Raw Excerpt\n{}\n\n## Promotion Checklist\n- Human review before moving into `templates/`.\n- Split into short reusable fragments; do not copy raw prompt wholesale.\n- Run `selfiek library lint --json` and `selfiek compile --json` after promotion.\n",
+        serde_yaml::to_string(&fm)?,
+        candidate.title,
+        candidate.claimed_value,
+        candidate.quality_dimensions.join(", "),
+        candidate.style_tags.join(", "),
+        candidate.fun_axes.join(", "),
+        candidate.raw_excerpt
+    ))
+}
+
+fn create_note_if_absent(path: &Path, content: &str) -> Result<bool> {
+    if path.exists() {
+        return Ok(false);
+    }
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = File::options()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create note without clobbering {}", path.display()))?;
+    file.write_all(content.as_bytes())?;
+    Ok(true)
+}
+
+fn library_harvest(
+    cli: &Cli,
+    source: &Path,
+    dry_run: bool,
+    apply: bool,
+    limit: usize,
+    min_quality: f64,
+    min_fun: f64,
+) -> Result<Value> {
+    if dry_run == apply {
+        bail!("choose exactly one of --dry-run or --apply");
+    }
+    if !(0.0..=5.0).contains(&min_quality) || !(0.0..=5.0).contains(&min_fun) {
+        bail!("min-quality and min-fun must be between 0.0 and 5.0");
+    }
+    if !source.exists() {
+        bail!("harvest source does not exist: {}", source.display());
+    }
+    let files: Vec<PathBuf> = harvest_inputs(source).into_iter().take(limit).collect();
+    let created_at = Local::now().to_rfc3339();
+    let inbox_rel = "inbox/external-prompts";
+    let mut actions = Vec::new();
+    let mut accepted_count = 0usize;
+    let mut rejected_count = 0usize;
+    let mut written_count = 0usize;
+    let mut skipped_existing_count = 0usize;
+
+    for path in files {
+        let candidate = harvest_candidate_from_file(&path, min_quality, min_fun)?;
+        if candidate.accepted {
+            accepted_count += 1;
+        } else {
+            rejected_count += 1;
+        }
+        let hash = short_hash(&candidate.id_seed);
+        let source_rel = format!("{}/sources/src-{}.md", inbox_rel, hash);
+        let target_dir = if candidate.accepted {
+            "candidates"
+        } else {
+            "rejected"
+        };
+        let candidate_rel = format!("{}/{}/{}.md", inbox_rel, target_dir, candidate.id_seed);
+        let source_path = cli.prompt_lib.join(&source_rel);
+        let candidate_path = cli.prompt_lib.join(&candidate_rel);
+        let mut source_written = false;
+        let mut candidate_written = false;
+
+        if apply {
+            if candidate.accepted {
+                source_written = create_note_if_absent(
+                    &source_path,
+                    &harvest_source_note(&candidate, &created_at),
+                )?;
+                if !source_written {
+                    skipped_existing_count += 1;
+                } else {
+                    written_count += 1;
+                }
+            }
+            let note = harvest_candidate_note(
+                &candidate,
+                &created_at,
+                if candidate.accepted {
+                    Some(source_rel.as_str())
+                } else {
+                    None
+                },
+            )?;
+            candidate_written = create_note_if_absent(&candidate_path, &note)?;
+            if !candidate_written {
+                skipped_existing_count += 1;
+            } else {
+                written_count += 1;
+            }
+        }
+
+        actions.push(json!({
+            "input":path,
+            "candidate":harvest_candidate_value(&candidate),
+            "accepted":candidate.accepted,
+            "source_note": if candidate.accepted { Value::String(source_path.to_string_lossy().to_string()) } else { Value::Null },
+            "candidate_note":candidate_path,
+            "source_written":source_written,
+            "candidate_written":candidate_written,
+            "skipped_existing": apply && !candidate_written
+        }));
+    }
+
+    Ok(json!({
+        "ok":true,
+        "schema":"selfiek.library_harvest.v1",
+        "version":VERSION,
+        "dry_run":dry_run,
+        "applied":apply,
+        "source":source,
+        "limit":limit,
+        "thresholds":{
+            "min_quality":min_quality,
+            "min_fun":min_fun,
+            "max_risk_auto_accept":3.9
+        },
+        "counts":{
+            "inputs":actions.len(),
+            "accepted":accepted_count,
+            "rejected":rejected_count,
+            "written":written_count,
+            "skipped_existing":skipped_existing_count
+        },
+        "actions":actions,
+        "policy":"offline_intake_only_no_generation_no_runtime_weight_write_no_cdper"
+    }))
 }
 
 fn library_optimize(cli: &Cli, dry_run: bool) -> Result<Value> {
@@ -2876,6 +3518,22 @@ fn library_command(cli: &Cli, command: &LibraryCommands) -> Result<Value> {
             dry_run,
             apply,
         } => library_ingest(cli, source, *dry_run, *apply),
+        LibraryCommands::Harvest {
+            source,
+            dry_run,
+            apply,
+            limit,
+            min_quality,
+            min_fun,
+        } => library_harvest(
+            cli,
+            source,
+            *dry_run,
+            *apply,
+            *limit,
+            *min_quality,
+            *min_fun,
+        ),
     }
 }
 fn load_template_index(cli: &Cli) -> Option<TemplateIndex> {
@@ -3718,6 +4376,50 @@ mod tests {
             second.is_err(),
             "second ingest must not overwrite existing notes"
         );
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn harvest_filters_generated_inbox_notes_when_source_is_inbox_root() {
+        let root = temp_path("harvest-filter");
+        let cli = test_cli(&root);
+        let watchlist = cli.prompt_lib.join("inbox/external-prompts/watchlist");
+        fs::create_dir_all(&watchlist).unwrap();
+        fs::write(
+            watchlist.join("fisheye.md"),
+            "---\ntitle: 鱼眼蒸汽波地铁自拍模板\nsource_url: https://example.invalid/fisheye\nsource_type: watchlist_seed\nquality_dimensions: [camera_authenticity, background_realism]\nstyle_tags: [fisheye, vaporwave]\nfun_axes: [novelty, persona_fit]\nquality_score: 4.2\nfun_score: 4.1\nrisk_score: 0.8\n---\n\n18mm 鱼眼前摄自拍，地铁玻璃反射紫粉霓虹，皮肤有真实颗粒。\n",
+        )
+        .unwrap();
+        let first = library_harvest(&cli, &watchlist, false, true, 20, 3.0, 2.0).unwrap();
+        assert_eq!(first["counts"]["accepted"].as_u64(), Some(1));
+        assert_eq!(first["counts"]["written"].as_u64(), Some(2));
+        let inbox = cli.prompt_lib.join("inbox/external-prompts");
+        let second = library_harvest(&cli, &inbox, false, true, 20, 3.0, 2.0).unwrap();
+        assert_eq!(second["counts"]["inputs"].as_u64(), Some(1));
+        assert_eq!(second["counts"]["written"].as_u64(), Some(0));
+        assert!(second["counts"]["skipped_existing"].as_u64().unwrap_or(0) >= 2);
+        fs::remove_dir_all(root).ok();
+    }
+
+    #[test]
+    fn harvest_uses_heuristic_risk_as_floor_for_imported_scores() {
+        let root = temp_path("harvest-risk");
+        fs::create_dir_all(&root).unwrap();
+        let source = root.join("spoofed-low-risk.md");
+        fs::write(
+            &source,
+            "---\ntitle: spoofed high risk\nrisk_score: 0.1\nquality_score: 4.5\nfun_score: 4.5\n---\n\nunderage teen nude celebrity face swap portrait prompt\n",
+        )
+        .unwrap();
+        let candidate = harvest_candidate_from_file(&source, 3.0, 2.0).unwrap();
+        assert!(!candidate.accepted);
+        assert!(candidate.risk_score >= 4.0);
+        assert!(candidate
+            .reject_reasons
+            .contains(&"risk_score_too_high".to_string()));
+        assert!(candidate
+            .risk_notes
+            .contains(&"age_sensitive_terms".to_string()));
         fs::remove_dir_all(root).ok();
     }
 

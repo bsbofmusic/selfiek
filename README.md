@@ -56,6 +56,8 @@ selfiek validate-config --json
 selfiek library lint --json
 selfiek library report --json
 selfiek library optimize --dry-run --json
+selfiek library harvest --source /path/to/watchlist-or-search-export --dry-run --json
+selfiek library harvest --source /path/to/watchlist-or-search-export --apply --json
 selfiek feedback rate --image /path/to/used.png --score 2 --reason "natural" --like scene.concert,outfit.casual --dislike face_likeness --json
 selfiek preference compile --json
 selfiek preference report --json
@@ -74,6 +76,8 @@ selfiek cleanup-used --json
 
 - `runtime_version`: latest release
 - `contract_version`: latest release
+
+SelfieK 3.10 adds deterministic prompt-template harvesting: `library harvest --source <path> --dry-run|--apply` scores external prompt references for quality, fun, and risk, then writes review-only notes under `inbox/external-prompts/{sources,candidates,rejected}`. It is a daily/cron-friendly intake lane for growing the template library: it never generates images, never rewrites runtime prompts, never updates compiled weights, and never calls cdper. Human promotion into `templates/` plus `library lint`/`compile` remains the only way harvested material reaches stock generation.
 
 SelfieK 3.7 adds the Preference Engine: `feedback rate` records immutable feedback events linked to image sidecars and prompt cards; `preference compile` aggregates those events into `preference_model.json`, `preference_report.json`, and preference-aware `weights.json`; `preference report` explains positive/negative element trends; `preference evolve --dry-run` proposes candidate boosts/penalties without rewriting prompts. The hot path remains deterministic and offline: no LLM optimizer, no UI, no daemon, no MCP loop, and no cdper rewrite.
 

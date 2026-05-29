@@ -520,7 +520,7 @@ dependencies = [
 
 [[package]]
 name = "selfiek-core"
-version = "3.9.0"
+version = "3.10.0"
 dependencies = [
  "anyhow",
  "chrono",

@@ -11,6 +11,8 @@ selfiek validate-config --json
 selfiek library lint --json
 selfiek library report --json
 selfiek library optimize --dry-run --json
+selfiek library harvest --source /path/to/watchlist-or-search-export --dry-run --json
+selfiek library harvest --source /path/to/watchlist-or-search-export --apply --json
 selfiek feedback rate --image /path/to/used.png --score 2 --reason "natural" --like scene.concert,outfit.casual --dislike face_likeness --json
 selfiek preference compile --json
 selfiek preference report --json
@@ -46,4 +48,4 @@ stock:
   new_limit: 100
 ```
 
-Prompt-library guardrails are intentionally lightweight: `library lint/report` can surface prompt-injection-like raw source text, raw-copy risk, placeholder preservation state, structured JSON key preservation hints, feedback visible-fact warnings, coverage gaps, and inventory sidecar quality. `library optimize --dry-run` returns an offline no-write plan; it does not rewrite prompts automatically. Preference Engine commands (`feedback rate`, `preference compile/report/evolve --dry-run`) learn from explicit photo feedback by compiling immutable feedback events into offline weights and reports. The package does not include an LLM prompt optimizer, UI, daemon, MCP optimize tool, or image-generation backend.
+Prompt-library guardrails are intentionally lightweight: `library lint/report` can surface prompt-injection-like raw source text, raw-copy risk, placeholder preservation state, structured JSON key preservation hints, feedback visible-fact warnings, coverage gaps, and inventory sidecar quality. `library harvest --source <path> --dry-run|--apply` is an offline intake lane for external prompt references: it scores quality/fun/risk and writes review-only notes under `inbox/external-prompts`, without generating images, rewriting prompts, updating weights, or calling cdper. `library optimize --dry-run` returns an offline no-write plan; it does not rewrite prompts automatically. Preference Engine commands (`feedback rate`, `preference compile/report/evolve --dry-run`) learn from explicit photo feedback by compiling immutable feedback events into offline weights and reports. The package does not include an LLM prompt optimizer, UI, daemon, MCP optimize tool, or image-generation backend.
